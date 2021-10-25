@@ -94,21 +94,34 @@ func (rf *Raft) readPersist(data []byte) {
 // example RequestVote RPC arguments structure.
 //
 type RequestVoteArgs struct {
-	// Your data here.
+	Term        int
+	CandidateId int
+	// LastLogIndex
+	// LastLogTerm
 }
 
 //
 // example RequestVote RPC reply structure.
 //
 type RequestVoteReply struct {
-	// Your data here.
+	Term        int
+	VoteGranted bool
 }
 
 //
 // example RequestVote RPC handler.
 //
 func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
-	// Your code here.
+	// if args.Term < currentTerm:
+	// set reply.votegranted = false
+	// set reply.Term = currentTerm
+	//
+	// if votedFor == 0 or votedFor == candidateId:
+	// also some other logic we gotta deal with in ass3
+	// get mutex and change apna term and vote
+	// set reply.votegranted = true
+	// set reply.Term = args.Term
+	//
 }
 
 //
@@ -130,6 +143,36 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 //
 func (rf *Raft) sendRequestVote(server int, args RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+	return ok
+}
+
+type AppendEntriesArgs struct {
+	Term     int
+	LeaderId int
+	// PrevLogIndex
+	// PrevLogTerm
+	// Entries[]
+	// LeaderCommit
+}
+type AppendEntriesReply struct {
+	Term    int
+	Success bool
+}
+
+func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) {
+
+	// if args.Term < currentTerm:
+	// reply.Success = false
+	// reply.Term = currentTerm
+
+	// if args.Term >= currentTerm:
+	// drop a msg in channel to drop candidate status and fall back to follower of this leader
+	// reply.Success = true
+	// reply.Term = args.Term
+}
+
+func (rf *Raft) sendAppendEntries(server int, args AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
 }
 
@@ -184,8 +227,81 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// Your initialization code here.
 
+	// what to do:
+
+	// start heartbeat timeout (some go channel with a recieving channel)
+	// start to recieve messages in the
+
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	return rf
 }
+
+/*
+func wait_for_heartbeat(chan recieveHeartbeats) {
+	start timer
+	either timer times out, or you recieve somethign in recieveHeartbeats channel from RPC
+
+	if you recieve heartbeat then just restart the timer and reloop,
+
+	if timer times out, start a leader election, AND CLOSE THIS go routine
+
+}
+*/
+
+/*
+func startLeaderElection() {
+
+	- obtain mutex lock
+		- increment current term
+		- change state to candidate
+		- add an append entries channel
+		- vote for self
+	- release mutex lock
+
+	- send RequestVote RPCs to all other servers (in go channels)
+	- if they reply with success channel main daalo kek
+
+	number of votes = 1
+
+	- either you
+		1. receive a RequestVoteRPC result:
+			- if success:
+				numOfVotes++
+				if numVotes >= majority:
+					make_self_leader()
+			- else:
+				- fall_back_to_follower()
+				- end this thread
+		2. timeout:
+			- go startLeaderElection()
+			- end this thread
+		3. append entries rpc value:
+			- fall_back_to_follower()
+			- end this thread
+
+}
+*/
+
+/*
+func make_self_leader() {
+	yay im leader, make a channel to leave this thread when we are no longer leader
+	now i will update my state
+	then
+	either
+		in every 1/10 s i will do this:
+			send appendentries
+			if success, good.
+			if not, fall_back_to_follower(term) and append to channel that we are not leader
+		or someone appended to our channel that we are no longer leader:
+			fallbacktofollower(term)
+}
+*/
+
+/*
+func fallbacktofollower(){
+	endelection and fallback to follower state
+	go wait_for_heartbeat ()
+}
+*/
