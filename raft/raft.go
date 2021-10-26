@@ -226,16 +226,20 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here.
+	// obtain mutex lock and initialize variables
 
-	// what to do:
-
-	// start heartbeat timeout (some go channel with a recieving channel)
-	// start to recieve messages in the
+	// become follower
+	go rf.beFollower()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	return rf
+}
+
+func (rf *Raft) beFollower() {
+	// start heartbeat timeout (some go channel with a recieving channel)
+	// start to recieve messages in appendentries
 }
 
 /*
