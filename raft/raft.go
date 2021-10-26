@@ -468,6 +468,7 @@ func (rf *Raft) callReqVoteRPCs(chanHasWonElection chan bool, chanUpdatedTerm ch
 
 }
 
+// Note: I'm ignoring RequestVote RPCs in candidate state
 func (rf *Raft) beCandidate() {
 
 	// start leader election
@@ -493,17 +494,46 @@ func (rf *Raft) beCandidate() {
 	for {
 		select {
 
+		// we have won election
 		case <-chanHasWonElection:
-			// we have won election, become leader and exit candidate thread.
 			// STATE TRANSITION: candidate -> leader
 			rf.changeServerStateTo("leader")
 			exitCandidateState = true
 
+		// election timeout occured
 		case <-electionTimer.C:
 			// STATE TRANSITION: candidate -> candidate
+			rf.changeServerStateTo("candidate") // restart candidate state
 			exitCandidateState = true           // exit the candidate state
 			chanCancelElection <- true          // end the wait for ReqVote RPCs
-			rf.changeServerStateTo("candidate") // restart candidate state
+
+		// we have discovered a leader's heartbeat
+		case args := <-rf.chanAppendEntriesArgs:
+
+			// reply to append entries
+			reply := rf.getAppendEntriesReply(args)
+			rf.chanAppendEntriesReply <- AppendEntriesReply{reply.Term, reply.Success}
+
+			// if the leader is legitimate
+			if reply.Success {
+				// STATE TRANSITION: candidate -> follower
+				rf.changeServerStateTo("candidate")
+				exitCandidateState = true
+				chanCancelElection <- true
+			}
+
+		// we have discovered a higher term from a RequestVote RPC
+		case updatedTerm := <-chanUpdatedTerm:
+
+			// update our term
+			rf.mu.Lock()
+			rf.currentTerm = updatedTerm // vote for self
+			rf.mu.Unlock()
+
+			// STATE TRANSITION: candidate -> follower
+			rf.changeServerStateTo("follower") // become follower
+			exitCandidateState = true          // exit the candidate state
+			chanCancelElection <- true         // end the wait for ReqVote RPCs
 
 		}
 
@@ -511,24 +541,6 @@ func (rf *Raft) beCandidate() {
 			break
 		}
 	}
-
-	// number of votes = 1
-
-	// - either you
-	// 	1. receive a RequestVoteRPC result:
-	// 		- if success:
-	// 			numOfVotes++
-	// 			if numVotes >= majority:
-	// 				make_self_leader()
-	// 		- else:
-	// 			- fall_back_to_follower()
-	// 			- end this thread
-	// 	2. timeout:
-	// 		- go startLeaderElection()
-	// 		- end this thread
-	// 	3. append entries rpc value:
-	// 		- fall_back_to_follower()
-	// 		- end this thread
 
 }
 
