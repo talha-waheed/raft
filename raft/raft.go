@@ -261,6 +261,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	return rf
 }
+
 func printWarning(toPrint string) {
 	fmt.Println("Warning: " + toPrint)
 }
@@ -327,17 +328,20 @@ func (rf *Raft) beFollower() {
 
 		// if we get a heartbeat
 		case appendEntriesArgs := <-rf.chanAppendEntriesArgs:
-			// reply to append entries as a follower
-			rf.chanAppendEntriesReply <- rf.getAppendEntriesReply(appendEntriesArgs)
 
-			// stop timer
+			// reply to append entries
+			reply := rf.getAppendEntriesReply(appendEntriesArgs)
+			rf.chanAppendEntriesReply <- AppendEntriesReply{reply.Term, reply.Success}
+
+			// as a follower, there is nothing to do with the reply, except to restart timer:
+			// 1. stop timer
 			if !heartbeatTimer.Stop() {
 				// just ensuring that if the channel has value,
 				// drain it before restarting (so we dont leak resources
 				// for keeping the channel indefinately up)
 				<-heartbeatTimer.C
 			}
-			// reset timer
+			// 2. reset timer
 			heartbeatTimer.Reset(getRandomTimeoutInterval())
 		}
 
