@@ -406,7 +406,67 @@ func (rf *Raft) beFollower() {
 	}
 }
 
-func (rf *Raft) callReqVoteRPCs(chanHasWonElection chan bool, chanCancelElection chan bool) {}
+// wrapper func around sendRequestVote(...) to receive RPC reply in a channel
+func (rf *Raft) sendRequestVoteRPC(chanReqVoteReplies chan RequestVoteReply, server int, args RequestVoteArgs, reply *RequestVoteReply) {
+	ok := rf.sendRequestVote(server, args, reply)
+	if ok {
+		chanReqVoteReplies <- RequestVoteReply{reply.Term, reply.VoteGranted}
+	}
+}
+
+func (rf *Raft) callReqVoteRPCs(chanHasWonElection chan bool, chanUpdatedTerm chan int, chanCancelElection chan bool) {
+
+	// makePayLoad
+	rf.mu.Lock()
+	numOfPeers := len(rf.peers)
+	myTerm := rf.currentTerm
+	myID := rf.me
+	rf.mu.Unlock()
+
+	// make buffered channel to receive replies from request vote RPCs
+	chanReqVoteReplies := make(chan RequestVoteReply, numOfPeers)
+
+	// call RPCs
+	for i := 0; i < numOfPeers; i++ {
+		go rf.sendRequestVoteRPC(chanReqVoteReplies, i, RequestVoteArgs{myTerm, myID}, &RequestVoteReply{Null, false})
+	}
+
+	numOfVotes := 0
+	end := false
+
+	// three scenarios for ending the following for loop:
+	// (i)   we achieve majority of votes -> main candidate has to become leader
+	// (ii)  if we receive a reply with term is greater than current term -> main candidate has to update term and become follower
+	// (iii) the main candidate thread asks it to exit
+	for {
+		select {
+		case reply := <-chanReqVoteReplies:
+			// if reply reached here, if it is true, nice we gained the vote:
+			if reply.VoteGranted {
+				numOfVotes++
+				if numOfVotes > numOfPeers/2 {
+					// we have acheived the majority
+					chanHasWonElection <- true // inform the candidate main thread
+					end = true                 // end this thread
+				}
+			} else {
+				// check if its term was greater than us, we have to fall back to becoming a follower and update our term
+				if reply.Term > myTerm {
+					chanUpdatedTerm <- reply.Term // inform this to the main candidate thread
+					end = true                    // end this thread
+				}
+			}
+
+		case <-chanCancelElection:
+			end = true // end this thread
+		}
+
+		if end {
+			break
+		}
+	}
+
+}
 
 func (rf *Raft) beCandidate() {
 
@@ -418,11 +478,11 @@ func (rf *Raft) beCandidate() {
 	rf.votedFor = rf.me // vote for self
 	rf.mu.Unlock()
 
-	// - send RequestVote RPCs to all other servers (in go channels)
-	// - if they reply with success channel main daalo kek
+	// send RequestVote RPCs to all other servers
 	chanHasWonElection := make(chan bool)
+	chanUpdatedTerm := make(chan int)
 	chanCancelElection := make(chan bool)
-	go rf.callReqVoteRPCs(chanHasWonElection, chanCancelElection)
+	go rf.callReqVoteRPCs(chanHasWonElection, chanUpdatedTerm, chanCancelElection)
 
 	// bool to break state's infinite for loop
 	exitCandidateState := false
@@ -432,7 +492,12 @@ func (rf *Raft) beCandidate() {
 
 	for {
 		select {
-		case hasWonElection := <-chanHasWonElection:
+
+		case <-chanHasWonElection:
+			// we have won election, become leader and exit candidate thread.
+			// STATE TRANSITION: candidate -> leader
+			rf.changeServerStateTo("leader")
+			exitCandidateState = true
 
 		case <-electionTimer.C:
 			// STATE TRANSITION: candidate -> candidate
