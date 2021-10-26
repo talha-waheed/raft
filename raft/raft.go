@@ -19,11 +19,17 @@ package raft
 
 import (
 	"labrpc"
+	"math/rand"
 	"sync"
+	"time"
 )
 
 // import "bytes"
 // import "encoding/gob"
+
+// heartbeat and election timeout in ms
+const MinTimeout = 300
+const MaxTimeout = 600
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -46,10 +52,15 @@ type Raft struct {
 	persister *Persister
 	me        int // index into peers[]
 
-	// Your data here.
-	// Look at the paper's Figure 2 for a description of what
-	// state a Raft server must maintain.
+	// persistent states
+	currentTerm int
+	votedFor    int
 
+	// volatile state
+	state string
+
+	// channels to recieve information from RPCs
+	chanAppendEntries chan AppendEntriesReply
 }
 
 // return currentTerm and whether this server
@@ -115,13 +126,16 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 	// if args.Term < currentTerm:
 	// set reply.votegranted = false
 	// set reply.Term = currentTerm
-	//
-	// if votedFor == 0 or votedFor == candidateId:
+
+	// else if votedFor == nil or votedFor == candidateId:
 	// also some other logic we gotta deal with in ass3
 	// get mutex and change apna term and vote
 	// set reply.votegranted = true
 	// set reply.Term = args.Term
 	//
+	// else:
+	// set reply.votegranted = false
+	// set reply.Term = currentTerm
 }
 
 //
@@ -225,10 +239,15 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.persister = persister
 	rf.me = me
 
-	// Your initialization code here.
-	// obtain mutex lock and initialize variables
+	// initialize our (volatile) state
+	rf.mu.Lock()
+	rf.currentTerm = 0
+	rf.votedFor = 0
+	rf.state = "follower"
+	rf.chanAppendEntries = make(chan AppendEntriesReply)
+	rf.mu.Unlock()
 
-	// become follower
+	// on startup, start by being a follower
 	go rf.beFollower()
 
 	// initialize from state persisted before a crash
@@ -237,56 +256,82 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	return rf
 }
 
+func getRandomTimeoutInterval() time.Duration {
+	return time.Duration(rand.Intn(MaxTimeout-MinTimeout)+MinTimeout) * time.Millisecond
+}
+
 func (rf *Raft) beFollower() {
-	// start heartbeat timeout (some go channel with a recieving channel)
-	// start to recieve messages in appendentries
+
+	exitFollowerState := false
+
+	// get timer for a heartbeat interval
+	heartbeatTimer := time.NewTimer(getRandomTimeoutInterval())
+
+	for {
+
+		select {
+
+		// if heartbeat times out
+		case <-heartbeatTimer.C:
+			// STATE TRANSITION: follower -> candidate
+			exitFollowerState = true // exit the follower state
+			go rf.beCandidate()      // become a candidate
+
+		// if we get a heartbeat
+		case <-rf.chanAppendEntries:
+			// reset timer
+
+			// stop timer
+			if !heartbeatTimer.Stop() {
+				// just ensuring that if the channel has value,
+				// drain it before restarting (so we dont leak resources
+				// for keeping the channel indefinately up)
+				<-heartbeatTimer.C
+			}
+			// reset timer
+			heartbeatTimer.Reset(getRandomTimeoutInterval())
+		}
+
+		if exitFollowerState {
+			break
+		}
+
+	}
 }
 
-/*
-func wait_for_heartbeat(chan recieveHeartbeats) {
-	start timer
-	either timer times out, or you recieve somethign in recieveHeartbeats channel from RPC
+func (rf *Raft) beCandidate() {
 
-	if you recieve heartbeat then just restart the timer and reloop,
+	// in other words, start leader election
 
-	if timer times out, start a leader election, AND CLOSE THIS go routine
+	// - obtain mutex lock
+	// 	- increment current term
+	// 	- change state to candidate
+	// 	- add an append entries channel
+	// 	- vote for self
+	// - release mutex lock
 
-}
-*/
+	// - send RequestVote RPCs to all other servers (in go channels)
+	// - if they reply with success channel main daalo kek
 
-/*
-func startLeaderElection() {
+	// number of votes = 1
 
-	- obtain mutex lock
-		- increment current term
-		- change state to candidate
-		- add an append entries channel
-		- vote for self
-	- release mutex lock
-
-	- send RequestVote RPCs to all other servers (in go channels)
-	- if they reply with success channel main daalo kek
-
-	number of votes = 1
-
-	- either you
-		1. receive a RequestVoteRPC result:
-			- if success:
-				numOfVotes++
-				if numVotes >= majority:
-					make_self_leader()
-			- else:
-				- fall_back_to_follower()
-				- end this thread
-		2. timeout:
-			- go startLeaderElection()
-			- end this thread
-		3. append entries rpc value:
-			- fall_back_to_follower()
-			- end this thread
+	// - either you
+	// 	1. receive a RequestVoteRPC result:
+	// 		- if success:
+	// 			numOfVotes++
+	// 			if numVotes >= majority:
+	// 				make_self_leader()
+	// 		- else:
+	// 			- fall_back_to_follower()
+	// 			- end this thread
+	// 	2. timeout:
+	// 		- go startLeaderElection()
+	// 		- end this thread
+	// 	3. append entries rpc value:
+	// 		- fall_back_to_follower()
+	// 		- end this thread
 
 }
-*/
 
 /*
 func make_self_leader() {
