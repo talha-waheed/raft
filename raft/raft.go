@@ -65,6 +65,8 @@ type Raft struct {
 	// channels to recieve information from RPCs
 	chanAppendEntriesArgs  chan AppendEntriesArgs
 	chanAppendEntriesReply chan AppendEntriesReply
+	chanRequestVoteArgs    chan RequestVoteArgs
+	chanRequestVoteReply   chan RequestVoteReply
 }
 
 // return currentTerm and whether this server
@@ -127,19 +129,15 @@ type RequestVoteReply struct {
 // example RequestVote RPC handler.
 //
 func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
-	// if args.Term < currentTerm:
-	// set reply.votegranted = false
-	// set reply.Term = currentTerm
+	// send the rpc request over to the follower/candidate/leader go routine running rn
+	rf.chanRequestVoteArgs <- args
 
-	// else if votedFor == nil or votedFor == candidateId:
-	// also some other logic we gotta deal with in ass3
-	// get mutex and change apna term and vote
-	// set reply.votegranted = true
-	// set reply.Term = args.Term
-	//
-	// else:
-	// set reply.votegranted = false
-	// set reply.Term = currentTerm
+	// it will examine server states and reply with the reply
+	replyFromChan := <-rf.chanRequestVoteReply
+
+	// send the reply received back
+	reply.Term = replyFromChan.Term
+	reply.VoteGranted = replyFromChan.VoteGranted
 }
 
 //
@@ -251,6 +249,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.state = "follower"
 	rf.chanAppendEntriesArgs = make(chan AppendEntriesArgs)
 	rf.chanAppendEntriesReply = make(chan AppendEntriesReply)
+	rf.chanRequestVoteArgs = make(chan RequestVoteArgs)
+	rf.chanRequestVoteReply = make(chan RequestVoteReply)
 	rf.mu.Unlock()
 
 	// on startup, start by being a follower
@@ -293,14 +293,16 @@ func (rf *Raft) getAppendEntriesReply(args AppendEntriesArgs) AppendEntriesReply
 	if rf.currentTerm > args.Term {
 		// current term gt sender's term, reject this msg
 		reply.Success = false
+		// and tell leader to update its term to rf.currentTerm
 		reply.Term = rf.currentTerm
 	} else {
 		// if this is the same or greater term, then this is the new leader, iski bait karo
 		// inform leader that we agree to it being the leader
 		reply.Success = true
 		reply.Term = args.Term
-		// change our state to agree to the leader
+		// change our term to conform to the leader
 		rf.currentTerm = args.Term
+		// if we had vote for anyone, clear it. We are beyond candidate state
 		rf.votedFor = Null
 	}
 
@@ -309,8 +311,52 @@ func (rf *Raft) getAppendEntriesReply(args AppendEntriesArgs) AppendEntriesReply
 	return reply
 }
 
+func (rf *Raft) getRequestVoteReply(args RequestVoteArgs) RequestVoteReply {
+
+	// wrap the execution of this func in locks
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	reply := RequestVoteReply{}
+
+	if args.Term < rf.currentTerm {
+		// if current term is greater than the requestvote term, send the currentTerm back
+		reply.Term = rf.currentTerm
+		reply.VoteGranted = false
+	} else {
+		// if reqvote term is equal to or greater than currentTerm, grant vote if
+		// (i) we haven't voted for anyone yet, and (ii) we have voted for this candidate before
+		if rf.votedFor == Null || rf.votedFor == args.CandidateId {
+			// inform reqester that we are voting for it
+			reply.Term = rf.currentTerm
+			reply.VoteGranted = true
+			// change our state to vote for the player
+			// note that we are not changing our term here,
+			rf.votedFor = args.CandidateId
+		} else
+		// if we have already voted
+		{
+			// if current term is greater than the requestvote term, send the currentTerm back
+			reply.Term = rf.currentTerm
+			reply.VoteGranted = false
+		}
+	}
+
+	// We have updated state variables in this function (rf.currentTerm and rf.votedFor).
+	// However, the calling function (beFollower, beCandidate, or beLeader) will be responsible
+	// to alter its behavior by inspecting this reply. e.g. the candidate will fall back to
+	// become a follower if reply.Success == true
+	return reply
+}
+
 func (rf *Raft) beFollower() {
 
+	// reset voted for before becoming a follower
+	rf.mu.Lock()
+	rf.votedFor = Null
+	rf.mu.Unlock()
+
+	// bool to break state's infinite for loop
 	exitFollowerState := false
 
 	// get timer for a heartbeat interval
@@ -327,13 +373,15 @@ func (rf *Raft) beFollower() {
 			rf.changeServerStateTo("candidate") // become a candidate
 
 		// if we get a heartbeat
-		case appendEntriesArgs := <-rf.chanAppendEntriesArgs:
+		case args := <-rf.chanAppendEntriesArgs:
 
 			// reply to append entries
-			reply := rf.getAppendEntriesReply(appendEntriesArgs)
+			reply := rf.getAppendEntriesReply(args)
 			rf.chanAppendEntriesReply <- AppendEntriesReply{reply.Term, reply.Success}
 
-			// as a follower, there is nothing to do with the reply, except to restart timer:
+			// as a follower, there is nothing to do with the reply, except to restart timer
+
+			// restart timer (as we received a heartbeat!):
 			// 1. stop timer
 			if !heartbeatTimer.Stop() {
 				// just ensuring that if the channel has value,
@@ -343,6 +391,12 @@ func (rf *Raft) beFollower() {
 			}
 			// 2. reset timer
 			heartbeatTimer.Reset(getRandomTimeoutInterval())
+
+		// SIDE TASK: reply to requestVoteRPCs
+		case args := <-rf.chanRequestVoteArgs:
+
+			reply := rf.getRequestVoteReply(args)
+			rf.chanRequestVoteReply <- RequestVoteReply{reply.Term, reply.VoteGranted}
 		}
 
 		if exitFollowerState {
@@ -351,6 +405,8 @@ func (rf *Raft) beFollower() {
 
 	}
 }
+
+func (rf *Raft) callReqVoteRPCs(chanHasWonElection chan bool, chanCancelElection chan bool) {}
 
 func (rf *Raft) beCandidate() {
 
@@ -364,6 +420,32 @@ func (rf *Raft) beCandidate() {
 
 	// - send RequestVote RPCs to all other servers (in go channels)
 	// - if they reply with success channel main daalo kek
+	chanHasWonElection := make(chan bool)
+	chanCancelElection := make(chan bool)
+	go rf.callReqVoteRPCs(chanHasWonElection, chanCancelElection)
+
+	// bool to break state's infinite for loop
+	exitCandidateState := false
+
+	// get timer for an election timeout
+	electionTimer := time.NewTimer(getRandomTimeoutInterval())
+
+	for {
+		select {
+		case hasWonElection := <-chanHasWonElection:
+
+		case <-electionTimer.C:
+			// STATE TRANSITION: candidate -> candidate
+			exitCandidateState = true           // exit the candidate state
+			chanCancelElection <- true          // end the wait for ReqVote RPCs
+			rf.changeServerStateTo("candidate") // restart candidate state
+
+		}
+
+		if exitCandidateState {
+			break
+		}
+	}
 
 	// number of votes = 1
 
