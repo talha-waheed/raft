@@ -20,6 +20,7 @@ package raft
 import (
 	"fmt"
 	"labrpc"
+	"math"
 	"math/rand"
 	"sync"
 	"time"
@@ -260,7 +261,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// initialize our (volatile) state
 	rf.mu.Lock()
 	rf.currentTerm = 0
-	rf.votedFor = 0
+	rf.votedFor = Null
 	rf.isLeader = false
 	rf.chanAppendEntriesArgs = make(chan AppendEntriesArgs)
 	rf.chanAppendEntriesReply = make(chan AppendEntriesReply)
@@ -278,13 +279,19 @@ func Make(peers []*labrpc.ClientEnd, me int,
 }
 
 func printWarning(toPrint string) {
-	fmt.Println("Warning: " + toPrint)
+	// fmt.Println("Warning: " + toPrint)
 }
 
 func (rf *Raft) changeServerStateTo(newServerState string) {
+
+	rf.mu.Lock()
+	myID := rf.me
+	rf.mu.Unlock()
+
 	if newServerState == "follower" {
 		go rf.beFollower()
 	} else if newServerState == "candidate" {
+		printWarning(fmt.Sprintf("candidate %d", myID))
 		go rf.beCandidate()
 	} else if newServerState == "leader" {
 		go rf.beLeader()
@@ -343,17 +350,28 @@ func (rf *Raft) getRequestVoteReply(args RequestVoteArgs) RequestVoteReply {
 		// (i) we haven't voted for anyone yet, and (ii) we have voted for this candidate before
 		if rf.votedFor == Null || rf.votedFor == args.CandidateId {
 			// inform reqester that we are voting for it
-			reply.Term = rf.currentTerm
+			reply.Term = int(math.Max(float64(args.Term), float64(rf.currentTerm)))
 			reply.VoteGranted = true
 			// change our state to vote for the player
-			// note that we are not changing our term here,
+			// // note that earlier I was not changing our term here,
 			rf.votedFor = args.CandidateId
+			rf.currentTerm = int(math.Max(float64(args.Term), float64(rf.currentTerm)))
 		} else
 		// if we have already voted
 		{
-			// if current term is greater than the requestvote term, send the currentTerm back
-			reply.Term = rf.currentTerm
-			reply.VoteGranted = false
+			if args.Term > rf.currentTerm {
+				// if current term is greater than the requestvote term, send the currentTerm back
+				reply.Term = args.Term
+				reply.VoteGranted = true
+
+				rf.votedFor = args.CandidateId
+				rf.currentTerm = args.Term
+			} else {
+				// if current term is greater than the requestvote term, send the currentTerm back
+				reply.Term = rf.currentTerm
+				reply.VoteGranted = false
+			}
+
 		}
 	}
 
@@ -368,8 +386,8 @@ func (rf *Raft) beFollower() {
 
 	// reset voted for before becoming a follower
 	rf.mu.Lock()
-	rf.isLeader = true
-	rf.votedFor = Null
+	rf.isLeader = false
+	myID := rf.me
 	rf.mu.Unlock()
 
 	// bool to break state's infinite for loop
@@ -377,6 +395,7 @@ func (rf *Raft) beFollower() {
 
 	// get timer for a heartbeat interval
 	heartbeatTimer := time.NewTimer(getRandomTimeoutInterval())
+	t1 := time.Now()
 
 	for {
 
@@ -385,6 +404,7 @@ func (rf *Raft) beFollower() {
 		// if heartbeat times out
 		case <-heartbeatTimer.C:
 			// STATE TRANSITION: follower -> candidate
+			printWarning(fmt.Sprintf("hearbeat timeout %d with elapsed: %d", myID, time.Since(t1)/1000000))
 			exitFollowerState = true            // exit the follower state
 			rf.changeServerStateTo("candidate") // become a candidate
 
@@ -397,16 +417,20 @@ func (rf *Raft) beFollower() {
 
 			// as a follower, there is nothing to do with the reply, except to restart timer
 
-			// restart timer (as we received a heartbeat!):
-			// 1. stop timer
-			if !heartbeatTimer.Stop() {
-				// just ensuring that if the channel has value,
-				// drain it before restarting (so we dont leak resources
-				// for keeping the channel indefinately up)
-				<-heartbeatTimer.C
+			// if legitimate heartbeat
+			if reply.Success {
+				// restart timer (as we received a heartbeat!):
+				// 1. stop timer
+				if !heartbeatTimer.Stop() {
+					// just ensuring that if the channel has value,
+					// drain it before restarting (so we dont leak resources
+					// for keeping the channel indefinately up)
+					<-heartbeatTimer.C
+				}
+				// 2. reset timer
+				heartbeatTimer.Reset(getRandomTimeoutInterval())
+				t1 = time.Now()
 			}
-			// 2. reset timer
-			heartbeatTimer.Reset(getRandomTimeoutInterval())
 
 		// reply to requestVoteRPCs
 		case args := <-rf.chanRequestVoteArgs:
@@ -414,16 +438,20 @@ func (rf *Raft) beFollower() {
 			reply := rf.getRequestVoteReply(args)
 			rf.chanRequestVoteReply <- RequestVoteReply{reply.Term, reply.VoteGranted}
 
-			// restart timer (as we received a reqvote):
-			// 1. stop timer
-			if !heartbeatTimer.Stop() {
-				// just ensuring that if the channel has value,
-				// drain it before restarting (so we dont leak resources
-				// for keeping the channel indefinately up)
-				<-heartbeatTimer.C
+			// if legitimate heartbeat
+			if reply.VoteGranted {
+				// restart timer (as we received a reqvote):
+				// 1. stop timer
+				if !heartbeatTimer.Stop() {
+					// just ensuring that if the channel has value,
+					// drain it before restarting (so we dont leak resources
+					// for keeping the channel indefinately up)
+					<-heartbeatTimer.C
+				}
+				// 2. reset timer
+				heartbeatTimer.Reset(getRandomTimeoutInterval())
+				t1 = time.Now()
 			}
-			// 2. reset timer
-			heartbeatTimer.Reset(getRandomTimeoutInterval())
 		}
 
 		if exitFollowerState {
@@ -503,9 +531,10 @@ func (rf *Raft) beCandidate() {
 
 	// initialize state
 	rf.mu.Lock()
-	rf.isLeader = true
+	rf.isLeader = false
 	rf.currentTerm++    // increment current term
 	rf.votedFor = rf.me // vote for self
+	myTerm := rf.currentTerm
 	rf.mu.Unlock()
 
 	// send RequestVote RPCs to all other servers
@@ -526,6 +555,9 @@ func (rf *Raft) beCandidate() {
 		// we have won election
 		case <-chanHasWonElection:
 			// STATE TRANSITION: candidate -> leader
+			rf.mu.Lock()
+			rf.isLeader = true
+			rf.mu.Unlock()
 			rf.changeServerStateTo("leader")
 			exitCandidateState = true
 
@@ -563,6 +595,19 @@ func (rf *Raft) beCandidate() {
 			rf.changeServerStateTo("follower") // become follower
 			exitCandidateState = true          // exit the candidate state
 			chanCancelElection <- true         // end the wait for ReqVote RPCs
+
+		// reply to requestVoteRPCs
+		case args := <-rf.chanRequestVoteArgs:
+
+			reply := rf.getRequestVoteReply(args)
+			rf.chanRequestVoteReply <- RequestVoteReply{reply.Term, reply.VoteGranted}
+
+			if reply.Term > myTerm {
+				// STATE TRANSITION: candidate -> follower
+				rf.changeServerStateTo("follower") // become follower
+				exitCandidateState = true          // exit the candidate state
+				chanCancelElection <- true         // end the wait for ReqVote RPCs
+			}
 
 		}
 
@@ -662,7 +707,6 @@ func (rf *Raft) beLeader() {
 	// set state
 	rf.mu.Lock()
 	rf.isLeader = true
-	rf.votedFor = Null
 	numOfPeers := len(rf.peers)
 	myTerm := rf.currentTerm
 	myID := rf.me
@@ -712,6 +756,39 @@ func (rf *Raft) beLeader() {
 				exitLeaderState = true
 				chanStopHeartbeats <- true
 			}
+
+		// we have discovered a higher term from a RequestVote RPC
+		case updatedTerm := <-chanUpdatedTerm:
+
+			// update our term
+			rf.mu.Lock()
+			rf.currentTerm = updatedTerm // vote for self
+			rf.mu.Unlock()
+
+			// STATE TRANSITION: candidate -> follower
+			rf.changeServerStateTo("follower") // become follower
+			exitLeaderState = true             // exit the candidate state
+			chanStopHeartbeats <- true         // end the wait for ReqVote RPCs
+
+		// reply to requestVoteRPCs
+		case args := <-rf.chanRequestVoteArgs:
+
+			reply := rf.getRequestVoteReply(args)
+			rf.chanRequestVoteReply <- RequestVoteReply{reply.Term, reply.VoteGranted}
+
+			if reply.Term > myTerm {
+
+				// change state
+				rf.mu.Lock()
+				rf.isLeader = false
+				rf.mu.Unlock()
+
+				// STATE TRANSITION: candidate -> follower
+				rf.changeServerStateTo("follower") // become follower
+				exitLeaderState = true             // exit the candidate state
+				chanStopHeartbeats <- true         // end the wait for ReqVote RPCs
+			}
+
 		}
 
 		if exitLeaderState {
