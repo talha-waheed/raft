@@ -18,6 +18,7 @@ package raft
 //
 
 import (
+	"fmt"
 	"labrpc"
 	"math/rand"
 	"sync"
@@ -30,6 +31,8 @@ import (
 // heartbeat and election timeout in ms
 const MinTimeout = 300
 const MaxTimeout = 600
+
+const Null int = -1
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -60,7 +63,8 @@ type Raft struct {
 	state string
 
 	// channels to recieve information from RPCs
-	chanAppendEntries chan AppendEntriesReply
+	chanAppendEntriesArgs  chan AppendEntriesArgs
+	chanAppendEntriesReply chan AppendEntriesReply
 }
 
 // return currentTerm and whether this server
@@ -175,14 +179,15 @@ type AppendEntriesReply struct {
 
 func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) {
 
-	// if args.Term < currentTerm:
-	// reply.Success = false
-	// reply.Term = currentTerm
+	// send the rpc request over to the follower/candidate/leader go routine running rn
+	rf.chanAppendEntriesArgs <- args
 
-	// if args.Term >= currentTerm:
-	// drop a msg in channel to drop candidate status and fall back to follower of this leader
-	// reply.Success = true
-	// reply.Term = args.Term
+	// it will examine server states and reply with the reply
+	replyFromChan := <-rf.chanAppendEntriesReply
+
+	// send the reply received back
+	reply.Success = replyFromChan.Success
+	reply.Term = replyFromChan.Term
 }
 
 func (rf *Raft) sendAppendEntries(server int, args AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -244,7 +249,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.currentTerm = 0
 	rf.votedFor = 0
 	rf.state = "follower"
-	rf.chanAppendEntries = make(chan AppendEntriesReply)
+	rf.chanAppendEntriesArgs = make(chan AppendEntriesArgs)
+	rf.chanAppendEntriesReply = make(chan AppendEntriesReply)
 	rf.mu.Unlock()
 
 	// on startup, start by being a follower
@@ -255,9 +261,51 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	return rf
 }
+func printWarning(toPrint string) {
+	fmt.Println("Warning: " + toPrint)
+}
+
+func (rf *Raft) changeServerStateTo(newServerState string) {
+	if newServerState == "follower" {
+		go rf.beFollower()
+	} else if newServerState == "candidate" {
+		go rf.beCandidate()
+	} else if newServerState == "leader" {
+		go rf.beLeader()
+	} else {
+		printWarning(fmt.Sprintf("%s is an invalid state", newServerState))
+	}
+}
 
 func getRandomTimeoutInterval() time.Duration {
 	return time.Duration(rand.Intn(MaxTimeout-MinTimeout)+MinTimeout) * time.Millisecond
+}
+
+func (rf *Raft) getAppendEntriesReply(args AppendEntriesArgs) AppendEntriesReply {
+
+	// wrap the execution of this func in locks
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	reply := AppendEntriesReply{}
+
+	if rf.currentTerm > args.Term {
+		// current term gt sender's term, reject this msg
+		reply.Success = false
+		reply.Term = rf.currentTerm
+	} else {
+		// if this is the same or greater term, then this is the new leader, iski bait karo
+		// inform leader that we agree to it being the leader
+		reply.Success = true
+		reply.Term = args.Term
+		// change our state to agree to the leader
+		rf.currentTerm = args.Term
+		rf.votedFor = Null
+	}
+
+	// the calling function (beFollower, beCandidate, or beLeader) will alter its behavior by inspecting this reply
+	// e.g. the candidate will fall back to become a follower if reply.Success == true
+	return reply
 }
 
 func (rf *Raft) beFollower() {
@@ -274,12 +322,13 @@ func (rf *Raft) beFollower() {
 		// if heartbeat times out
 		case <-heartbeatTimer.C:
 			// STATE TRANSITION: follower -> candidate
-			exitFollowerState = true // exit the follower state
-			go rf.beCandidate()      // become a candidate
+			exitFollowerState = true            // exit the follower state
+			rf.changeServerStateTo("candidate") // become a candidate
 
 		// if we get a heartbeat
-		case <-rf.chanAppendEntries:
-			// reset timer
+		case appendEntriesArgs := <-rf.chanAppendEntriesArgs:
+			// reply to append entries as a follower
+			rf.chanAppendEntriesReply <- rf.getAppendEntriesReply(appendEntriesArgs)
 
 			// stop timer
 			if !heartbeatTimer.Stop() {
@@ -301,14 +350,13 @@ func (rf *Raft) beFollower() {
 
 func (rf *Raft) beCandidate() {
 
-	// in other words, start leader election
+	// start leader election
 
-	// - obtain mutex lock
-	// 	- increment current term
-	// 	- change state to candidate
-	// 	- add an append entries channel
-	// 	- vote for self
-	// - release mutex lock
+	// initialize state
+	rf.mu.Lock()
+	rf.currentTerm++    // increment current term
+	rf.votedFor = rf.me // vote for self
+	rf.mu.Unlock()
 
 	// - send RequestVote RPCs to all other servers (in go channels)
 	// - if they reply with success channel main daalo kek
@@ -332,6 +380,8 @@ func (rf *Raft) beCandidate() {
 	// 		- end this thread
 
 }
+
+func (rf *Raft) beLeader() {}
 
 /*
 func make_self_leader() {
