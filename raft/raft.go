@@ -32,6 +32,9 @@ import (
 const MinTimeout = 300
 const MaxTimeout = 600
 
+// heartbeat interval
+const HeartbeatInterval = time.Second / 10
+
 const Null int = -1
 
 //
@@ -60,7 +63,7 @@ type Raft struct {
 	votedFor    int
 
 	// volatile state
-	state string
+	isLeader bool
 
 	// channels to recieve information from RPCs
 	chanAppendEntriesArgs  chan AppendEntriesArgs
@@ -211,6 +214,12 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	term := -1
 	isLeader := true
 
+	rf.mu.Lock()
+	index = rf.me
+	term = rf.currentTerm
+	isLeader = rf.isLeader
+	rf.mu.Unlock()
+
 	return index, term, isLeader
 }
 
@@ -246,7 +255,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.mu.Lock()
 	rf.currentTerm = 0
 	rf.votedFor = 0
-	rf.state = "follower"
+	rf.isLeader = false
 	rf.chanAppendEntriesArgs = make(chan AppendEntriesArgs)
 	rf.chanAppendEntriesReply = make(chan AppendEntriesReply)
 	rf.chanRequestVoteArgs = make(chan RequestVoteArgs)
@@ -353,6 +362,7 @@ func (rf *Raft) beFollower() {
 
 	// reset voted for before becoming a follower
 	rf.mu.Lock()
+	rf.isLeader = true
 	rf.votedFor = Null
 	rf.mu.Unlock()
 
@@ -392,11 +402,22 @@ func (rf *Raft) beFollower() {
 			// 2. reset timer
 			heartbeatTimer.Reset(getRandomTimeoutInterval())
 
-		// SIDE TASK: reply to requestVoteRPCs
+		// reply to requestVoteRPCs
 		case args := <-rf.chanRequestVoteArgs:
 
 			reply := rf.getRequestVoteReply(args)
 			rf.chanRequestVoteReply <- RequestVoteReply{reply.Term, reply.VoteGranted}
+
+			// restart timer (as we received a reqvote):
+			// 1. stop timer
+			if !heartbeatTimer.Stop() {
+				// just ensuring that if the channel has value,
+				// drain it before restarting (so we dont leak resources
+				// for keeping the channel indefinately up)
+				<-heartbeatTimer.C
+			}
+			// 2. reset timer
+			heartbeatTimer.Reset(getRandomTimeoutInterval())
 		}
 
 		if exitFollowerState {
@@ -428,10 +449,12 @@ func (rf *Raft) callReqVoteRPCs(chanHasWonElection chan bool, chanUpdatedTerm ch
 
 	// call RPCs
 	for i := 0; i < numOfPeers; i++ {
-		go rf.sendRequestVoteRPC(chanReqVoteReplies, i, RequestVoteArgs{myTerm, myID}, &RequestVoteReply{Null, false})
+		if i != myID {
+			go rf.sendRequestVoteRPC(chanReqVoteReplies, i, RequestVoteArgs{myTerm, myID}, &RequestVoteReply{Null, false})
+		}
 	}
 
-	numOfVotes := 0
+	numOfVotes := 1
 	end := false
 
 	// three scenarios for ending the following for loop:
@@ -465,7 +488,6 @@ func (rf *Raft) callReqVoteRPCs(chanHasWonElection chan bool, chanUpdatedTerm ch
 			break
 		}
 	}
-
 }
 
 // Note: I'm ignoring RequestVote RPCs in candidate state
@@ -475,6 +497,7 @@ func (rf *Raft) beCandidate() {
 
 	// initialize state
 	rf.mu.Lock()
+	rf.isLeader = true
 	rf.currentTerm++    // increment current term
 	rf.votedFor = rf.me // vote for self
 	rf.mu.Unlock()
@@ -517,7 +540,7 @@ func (rf *Raft) beCandidate() {
 			// if the leader is legitimate
 			if reply.Success {
 				// STATE TRANSITION: candidate -> follower
-				rf.changeServerStateTo("candidate")
+				rf.changeServerStateTo("follower")
 				exitCandidateState = true
 				chanCancelElection <- true
 			}
@@ -541,29 +564,152 @@ func (rf *Raft) beCandidate() {
 			break
 		}
 	}
-
 }
 
-func (rf *Raft) beLeader() {}
-
-/*
-func make_self_leader() {
-	yay im leader, make a channel to leave this thread when we are no longer leader
-	now i will update my state
-	then
-	either
-		in every 1/10 s i will do this:
-			send appendentries
-			if success, good.
-			if not, fall_back_to_follower(term) and append to channel that we are not leader
-		or someone appended to our channel that we are no longer leader:
-			fallbacktofollower(term)
+type AppendEntryRPCResponse struct {
+	ok    bool
+	reply AppendEntriesReply
 }
-*/
 
-/*
-func fallbacktofollower(){
-	endelection and fallback to follower state
-	go wait_for_heartbeat ()
+// wrapper func around sendAppendEntries(...) to receive RPC reply in a channel
+func (rf *Raft) sendAppendEntriesRPC(chanReplies chan AppendEntryRPCResponse, server int, args AppendEntriesArgs, reply *AppendEntriesReply) {
+	ok := rf.sendAppendEntries(server, args, reply)
+	chanReplies <- AppendEntryRPCResponse{ok, AppendEntriesReply{reply.Term, reply.Success}}
 }
-*/
+
+func (rf *Raft) sendHeartbeats(numOfPeers int, myTerm int, myID int, chanUpdatedTerm chan int) {
+
+	// make buffered channel to receive replies from RPCs
+	chanReplies := make(chan AppendEntryRPCResponse, numOfPeers-1)
+
+	// call RPCs
+	for i := 0; i < numOfPeers; i++ {
+		if i != myID {
+			go rf.sendAppendEntriesRPC(chanReplies, i, AppendEntriesArgs{myTerm, myID}, &AppendEntriesReply{Null, false})
+		}
+	}
+
+	numOfHeartbeatReplies := 1
+
+	// listen from responses
+	for {
+		response := <-chanReplies
+
+		numOfHeartbeatReplies++
+
+		// if we receive a heartbeat message responging unsucessfully, update our term and become follower
+		if response.ok && !response.reply.Success {
+			chanUpdatedTerm <- response.reply.Term
+		}
+
+		// if all responses are read, end this thread
+		if numOfHeartbeatReplies >= numOfPeers {
+			break
+		}
+	}
+}
+
+func (rf *Raft) periodicallySendHeartBeats(chanUpdatedTerm chan int, chanStop chan bool, numOfPeers int, myTerm int, myID int) {
+
+	go rf.sendHeartbeats(numOfPeers, myTerm, myID, chanUpdatedTerm)
+
+	// get timer for a heartbeat interval
+	heartbeatTimer := time.NewTimer(HeartbeatInterval)
+
+	exit := false
+
+	for {
+
+		select {
+
+		// if a duration of HeartbeatInterval has passed since last heartbeat:
+		case <-heartbeatTimer.C:
+
+			// resend heartbeats
+			go rf.sendHeartbeats(numOfPeers, myTerm, myID, chanUpdatedTerm)
+
+			// restart timer:
+			// 1. stop timer
+			if !heartbeatTimer.Stop() {
+				// just ensuring that if the channel has value,
+				// drain it before restarting (so we dont leak resources
+				// for keeping the channel indefinately up)
+				<-heartbeatTimer.C
+			}
+			// 2. reset timer
+			heartbeatTimer.Reset(HeartbeatInterval)
+
+		// main thread is asking us to stop sending heartbeats
+		case <-chanStop:
+			exit = true
+		}
+
+		if exit {
+			break
+		}
+	}
+}
+
+// Note: I'm ignoring RequestVote RPCs in leader state
+func (rf *Raft) beLeader() {
+
+	// set state
+	rf.mu.Lock()
+	rf.isLeader = true
+	rf.votedFor = Null
+	numOfPeers := len(rf.peers)
+	myTerm := rf.currentTerm
+	myID := rf.me
+	rf.mu.Unlock()
+
+	// send RequestVote RPCs to all other servers
+	chanUpdatedTerm := make(chan int)
+	chanStopHeartbeats := make(chan bool)
+	go rf.periodicallySendHeartBeats(chanUpdatedTerm, chanStopHeartbeats, numOfPeers, myTerm, myID)
+
+	exitLeaderState := false
+
+	for {
+		select {
+
+		// discovers server with higher term through heartbeat replies
+		case newTerm := <-chanUpdatedTerm:
+
+			// change state
+			rf.mu.Lock()
+			rf.currentTerm = newTerm
+			rf.isLeader = false
+			rf.mu.Unlock()
+
+			// STATE TRANSITION: leader -> follower
+			rf.changeServerStateTo("follower")
+			exitLeaderState = true
+			chanStopHeartbeats <- true
+
+		// if the leader gets a heartbeat
+		case args := <-rf.chanAppendEntriesArgs:
+
+			// reply to append entries
+			reply := rf.getAppendEntriesReply(args)
+			rf.chanAppendEntriesReply <- AppendEntriesReply{reply.Term, reply.Success}
+
+			// if the leader is legitimate
+			if reply.Success {
+
+				// change state
+				rf.mu.Lock()
+				rf.isLeader = false
+				rf.mu.Unlock()
+
+				// STATE TRANSITION: leader -> follower
+				rf.changeServerStateTo("follower")
+				exitLeaderState = true
+				chanStopHeartbeats <- true
+			}
+		}
+
+		if exitLeaderState {
+			break
+		}
+	}
+}
