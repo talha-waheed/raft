@@ -413,7 +413,6 @@ func (rf *Raft) beFollower() {
 
 			// reply to append entries
 			reply := rf.getAppendEntriesReply(args)
-			rf.chanAppendEntriesReply <- AppendEntriesReply{reply.Term, reply.Success}
 
 			// as a follower, there is nothing to do with the reply, except to restart timer
 
@@ -428,6 +427,7 @@ func (rf *Raft) beFollower() {
 					<-heartbeatTimer.C
 				}
 				// 2. reset timer
+				printWarning(fmt.Sprintf("resetting follower %d's heartbeat", myID))
 				heartbeatTimer.Reset(getRandomTimeoutInterval())
 				t1 = time.Now()
 			}
@@ -602,7 +602,7 @@ func (rf *Raft) beCandidate() {
 			reply := rf.getRequestVoteReply(args)
 			rf.chanRequestVoteReply <- RequestVoteReply{reply.Term, reply.VoteGranted}
 
-			if reply.Term > myTerm {
+			if reply.VoteGranted && reply.Term > myTerm {
 				// STATE TRANSITION: candidate -> follower
 				rf.changeServerStateTo("follower") // become follower
 				exitCandidateState = true          // exit the candidate state
@@ -618,14 +618,15 @@ func (rf *Raft) beCandidate() {
 }
 
 type AppendEntryRPCResponse struct {
-	ok    bool
-	reply AppendEntriesReply
+	ok     bool
+	reply  AppendEntriesReply
+	server int
 }
 
 // wrapper func around sendAppendEntries(...) to receive RPC reply in a channel
 func (rf *Raft) sendAppendEntriesRPC(chanReplies chan AppendEntryRPCResponse, server int, args AppendEntriesArgs, reply *AppendEntriesReply) {
 	ok := rf.sendAppendEntries(server, args, reply)
-	chanReplies <- AppendEntryRPCResponse{ok, AppendEntriesReply{reply.Term, reply.Success}}
+	chanReplies <- AppendEntryRPCResponse{ok, AppendEntriesReply{reply.Term, reply.Success}, server}
 }
 
 func (rf *Raft) sendHeartbeats(numOfPeers int, myTerm int, myID int, chanUpdatedTerm chan int) {
@@ -647,6 +648,8 @@ func (rf *Raft) sendHeartbeats(numOfPeers int, myTerm int, myID int, chanUpdated
 		response := <-chanReplies
 
 		numOfHeartbeatReplies++
+
+		printWarning(fmt.Sprintf("got hb response from %d in term %d: ok: %t, success: %t", response.server, response.reply.Term, response.ok, response.reply.Success))
 
 		// if we receive a heartbeat message responging unsucessfully, update our term and become follower
 		if response.ok && !response.reply.Success {
@@ -680,14 +683,6 @@ func (rf *Raft) periodicallySendHeartBeats(chanUpdatedTerm chan int, chanStop ch
 			go rf.sendHeartbeats(numOfPeers, myTerm, myID, chanUpdatedTerm)
 
 			// restart timer:
-			// 1. stop timer
-			if !heartbeatTimer.Stop() {
-				// just ensuring that if the channel has value,
-				// drain it before restarting (so we dont leak resources
-				// for keeping the channel indefinately up)
-				<-heartbeatTimer.C
-			}
-			// 2. reset timer
 			heartbeatTimer.Reset(HeartbeatInterval)
 
 		// main thread is asking us to stop sending heartbeats
@@ -776,7 +771,7 @@ func (rf *Raft) beLeader() {
 			reply := rf.getRequestVoteReply(args)
 			rf.chanRequestVoteReply <- RequestVoteReply{reply.Term, reply.VoteGranted}
 
-			if reply.Term > myTerm {
+			if reply.VoteGranted && reply.Term > myTerm {
 
 				// change state
 				rf.mu.Lock()

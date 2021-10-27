@@ -50,22 +50,60 @@ func (c *SafeCounter) GetV() int {
 	return val
 }
 
+const HeartbeatInterval = 1000 * time.Millisecond
+
+func periodicallySendHeartBeats(chanStop chan bool) {
+
+	// resend heartbeats
+	fmt.Println("Sending Heartbeats")
+
+	// get timer for a heartbeat interval
+	heartbeatTimer := time.NewTimer(HeartbeatInterval)
+
+	exit := false
+
+	for {
+
+		select {
+
+		// if a duration of HeartbeatInterval has passed since last heartbeat:
+		case <-time.After(1 * time.Second):
+
+			// resend heartbeats
+			fmt.Println("Sending Heartbeats")
+
+			// // restart timer:
+			// // 1. stop timer
+			if !heartbeatTimer.Stop() {
+				// just ensuring that if the channel has value,
+				// drain it before restarting (so we dont leak resources
+				// for keeping the channel indefinately up)
+				fmt.Println("came here 0")
+				<-heartbeatTimer.C
+				fmt.Println("came here 1")
+			}
+			// 2. reset timer
+			heartbeatTimer.Reset(HeartbeatInterval)
+
+		// main thread is asking us to stop sending heartbeats
+		case <-chanStop:
+			exit = true
+
+		}
+
+		if exit {
+			break
+		}
+	}
+}
+
 func main() {
-	myChan := make(chan int)
-	c := SafeCounter{v: 5, channel: myChan}
-	// for i := 0; i < 1000; i++ {
-	// 	go c.Inc("somekey")
-	// }
+	endChan := make(chan bool)
+	go periodicallySendHeartBeats(endChan)
 
-	go c.Sleep("somekey")
+	time.Sleep(5 * time.Second)
+	fmt.Println("ending")
+	endChan <- true
+	// time.Sleep(5 * time.Second)
 
-	time.Sleep(1 * time.Second)
-
-	go c.UseChannel()
-	myChan <- 4
-
-	fmt.Print("c.GetV:", c.GetV())
-
-	// time.Sleep(time.Second)
-	// fmt.Println(c.Value("somekey"))
 }
