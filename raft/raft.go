@@ -1,5 +1,11 @@
 package raft
 
+/*
+TO-DOS:
+1. Persist state whenever you change it
+2. rf.applyCommittedEntriesToStateMachine()
+*/
+
 //
 // this is an outline of the API that raft must expose to
 // the service (or tester). see comments below for
@@ -38,6 +44,12 @@ const HeartbeatInterval = time.Second / 10
 
 const Null int = -1
 
+type Log struct {
+	index   int
+	term    int
+	command interface{}
+}
+
 //
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
@@ -60,17 +72,26 @@ type Raft struct {
 	me        int // index into peers[]
 
 	// persistent states
-	currentTerm int
-	votedFor    int
+	currentTerm  int
+	votedFor     int
+	log          []Log
+	isLeader     bool   // specific to this impl. of raft
+	currentState string // specific to this impl. of raft
 
-	// volatile state
-	isLeader bool
+	// volatile states
+	commitIndex int
+	lastApplied int
+
+	// leader volatile state
+	nextIndex  []int
+	matchIndex []int
 
 	// channels to recieve information from RPCs
 	chanAppendEntriesArgs  chan AppendEntriesArgs
 	chanAppendEntriesReply chan AppendEntriesReply
 	chanRequestVoteArgs    chan RequestVoteArgs
 	chanRequestVoteReply   chan RequestVoteReply
+	chanNewCommand         chan interface{}
 }
 
 // return currentTerm and whether this server
@@ -117,19 +138,12 @@ func (rf *Raft) readPersist(data []byte) {
 	// d.Decode(&rf.yyy)
 }
 
-//
-// example RequestVote RPC arguments structure.
-//
 type RequestVoteArgs struct {
-	Term        int
-	CandidateId int
-	// LastLogIndex
-	// LastLogTerm
+	Term         int
+	CandidateId  int
+	LastLogIndex int
+	LastLogTerm  int
 }
-
-//
-// example RequestVote RPC reply structure.
-//
 type RequestVoteReply struct {
 	Term        int
 	VoteGranted bool
@@ -173,12 +187,12 @@ func (rf *Raft) sendRequestVote(server int, args RequestVoteArgs, reply *Request
 }
 
 type AppendEntriesArgs struct {
-	Term     int
-	LeaderId int
-	// PrevLogIndex
-	// PrevLogTerm
-	// Entries[]
-	// LeaderCommit
+	Term         int
+	LeaderId     int
+	PrevLogIndex int
+	PrevLogTerm  int
+	Entries      []Log
+	LeaderCommit int
 }
 type AppendEntriesReply struct {
 	Term    int
@@ -227,7 +241,16 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader = rf.isLeader
 	rf.mu.Unlock()
 
+	if isLeader {
+		go rf.addToRaftLog(command)
+	}
+
 	return index, term, isLeader
+}
+
+func (rf *Raft) addToRaftLog(command interface{}) {
+	// inform leader that there is a new command
+	rf.chanNewCommand <- command
 }
 
 //
@@ -258,40 +281,67 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.persister = persister
 	rf.me = me
 
-	// initialize our (volatile) state
-	rf.mu.Lock()
-	rf.currentTerm = 0
-	rf.votedFor = Null
-	rf.isLeader = false
-	rf.chanAppendEntriesArgs = make(chan AppendEntriesArgs)
-	rf.chanAppendEntriesReply = make(chan AppendEntriesReply)
-	rf.chanRequestVoteArgs = make(chan RequestVoteArgs)
-	rf.chanRequestVoteReply = make(chan RequestVoteReply)
-	rf.mu.Unlock()
-
-	// on startup, start by being a follower
-	go rf.beFollower()
+	// initialize our state variables
+	rf.initializeServerVars()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
+	// start the server in the state persisted before crash
+	rf.startServerState()
+
 	return rf
+}
+
+func (rf *Raft) initializeServerVars() {
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	// persistent state
+	rf.currentTerm = 0
+	rf.votedFor = Null
+	rf.log = make([]Log, 0)
+	rf.currentState = "follower"
+	rf.isLeader = false
+
+	// volatile state
+	rf.commitIndex = 0
+	rf.lastApplied = 0
+
+	// note: leader volatile state will be initialized when server becomes leader
+
+	// chans for communication
+	rf.chanAppendEntriesArgs = make(chan AppendEntriesArgs)
+	rf.chanAppendEntriesReply = make(chan AppendEntriesReply)
+	rf.chanRequestVoteArgs = make(chan RequestVoteArgs)
+	rf.chanRequestVoteReply = make(chan RequestVoteReply)
+	rf.chanNewCommand = make(chan interface{})
+
 }
 
 func printWarning(toPrint string) {
 	// fmt.Println("Warning: " + toPrint)
 }
 
+func (rf *Raft) startServerState() {
+	rf.mu.Lock()
+	currentState := rf.currentState
+	rf.mu.Unlock()
+
+	rf.changeServerStateTo(currentState)
+}
+
 func (rf *Raft) changeServerStateTo(newServerState string) {
 
-	rf.mu.Lock()
-	myID := rf.me
-	rf.mu.Unlock()
+	// rf.mu.Lock()
+	// myID := rf.me
+	// rf.mu.Unlock()
 
 	if newServerState == "follower" {
 		go rf.beFollower()
 	} else if newServerState == "candidate" {
-		printWarning(fmt.Sprintf("candidate %d", myID))
+		// printWarning(fmt.Sprintf("candidate %d", myID))
 		go rf.beCandidate()
 	} else if newServerState == "leader" {
 		go rf.beLeader()
@@ -312,7 +362,9 @@ func (rf *Raft) getAppendEntriesReply(args AppendEntriesArgs) AppendEntriesReply
 
 	reply := AppendEntriesReply{}
 
-	if rf.currentTerm > args.Term {
+	// 1. Reply false if term < currentTerm
+
+	if args.Term < rf.currentTerm {
 		// current term gt sender's term, reject this msg
 		reply.Success = false
 		// and tell leader to update its term to rf.currentTerm
@@ -328,9 +380,86 @@ func (rf *Raft) getAppendEntriesReply(args AppendEntriesArgs) AppendEntriesReply
 		rf.votedFor = Null
 	}
 
+	// 2. Reply false if log doesn’t contain an entry at prevLogIndex
+	//    whose term matches prevLogTerm (§5.3)
+	// 3. If an existing entry conflicts with a new one (same index
+	//    but different terms), delete the existing entry and all that
+	//    follow it (§5.3)
+	// 4. Append any new entries not already in the log
+	// 5. If leaderCommit > commitIndex, set commitIndex =
+	//    min(leaderCommit, index of last new entry)
+
+	// only do log replication if entries are not empty
+	if len(args.Entries) > 0 {
+		// ensure prev log is same, else reject it
+		if !rf.isPrevLogSame(args.PrevLogIndex, args.PrevLogTerm) {
+			reply.Success = false
+		} else {
+			// add the new entries to local log
+			rf.addEntriesFromLeaderToLog(args)
+			// if there is committable entries, commit them and pass them to state machine
+			if args.LeaderCommit > rf.commitIndex {
+				rf.commitNewEntries(args.LeaderCommit)
+				rf.applyCommittedEntriesToStateMachine()
+			}
+			reply.Success = true
+		}
+	}
+
 	// the calling function (beFollower, beCandidate, or beLeader) will alter its behavior by inspecting this reply
 	// e.g. the candidate will fall back to become a follower if reply.Success == true
 	return reply
+}
+
+func min(a int, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func (rf *Raft) commitNewEntries(leaderCommit int) {
+	last_log_index := len(rf.log) - 1
+	rf.commitIndex = min(leaderCommit, last_log_index)
+}
+
+func (rf *Raft) addEntriesFromLeaderToLog(args AppendEntriesArgs) {
+
+	// if no entries are sent
+	if len(args.Entries) == 0 {
+		return
+	}
+
+	// if there are entries to add:
+
+	// prune log until previndex
+	pruned_log_slice := rf.log[:args.PrevLogIndex+1]
+	pruned_log_deep_slice := make([]Log, len(pruned_log_slice))
+	copy(pruned_log_deep_slice, pruned_log_slice)
+	rf.log = pruned_log_deep_slice
+
+	// add entries ahead of it
+	rf.log = append(rf.log, args.Entries...)
+}
+
+func (rf *Raft) isPrevLogSame(prevLogIndex int, prevLogTerm int) bool {
+
+	// if there was no prevlog at the leader, return true
+	if prevLogIndex == -1 {
+		return true
+	}
+
+	// check if there is some entry at index == prevLogIndex
+	if len(rf.log) < prevLogIndex+1 {
+		return false
+	}
+
+	// check if the term at that index is the same
+	if rf.log[prevLogIndex].term == prevLogTerm {
+		return true
+	} else {
+		return false
+	}
 }
 
 func (rf *Raft) getRequestVoteReply(args RequestVoteArgs) RequestVoteReply {
@@ -629,15 +758,68 @@ func (rf *Raft) sendAppendEntriesRPC(chanReplies chan AppendEntryRPCResponse, se
 	chanReplies <- AppendEntryRPCResponse{ok, AppendEntriesReply{reply.Term, reply.Success}, server}
 }
 
+func (rf *Raft) getLogTerm(i int) int {
+	if i > len(rf.log)-1 {
+		printWarning(fmt.Sprintf("Trying to get log at index %d i.e. out of range", i))
+		return rf.log[i].term
+	} else if i < -1 {
+		printWarning(fmt.Sprintf("Trying to get log at index %d", i))
+		return -1
+	} else if i == -1 {
+		return -1
+	} else {
+		return rf.log[i].term
+	}
+}
+
+func (rf *Raft) getEntriesForServer(i int) []Log {
+
+	beginIndex := rf.nextIndex[i]
+
+	entries_shallow_copy := rf.log[beginIndex:]
+
+	entries_deep_copy := make([]Log, len(entries_shallow_copy))
+	copy(entries_deep_copy, entries_shallow_copy)
+
+	return entries_deep_copy
+}
+
+func (rf *Raft) getAppendEntriesArgs(numOfPeers int, myTerm int, myID int) []AppendEntriesArgs {
+
+	appendEntriesArgs := make([]AppendEntriesArgs, numOfPeers)
+
+	rf.mu.Lock()
+
+	for i, _ := range appendEntriesArgs {
+		if i != myID {
+			appendEntriesArgs[i] = AppendEntriesArgs{
+				Term:         myTerm,
+				LeaderId:     myID,
+				PrevLogIndex: rf.nextIndex[i] - 1,
+				PrevLogTerm:  rf.getLogTerm(rf.nextIndex[i] - 1),
+				Entries:      rf.getEntriesForServer(i),
+				LeaderCommit: rf.commitIndex,
+			}
+		}
+	}
+
+	rf.mu.Unlock()
+
+	return appendEntriesArgs
+}
+
 func (rf *Raft) sendHeartbeats(numOfPeers int, myTerm int, myID int, chanUpdatedTerm chan int) {
 
 	// make buffered channel to receive replies from RPCs
 	chanReplies := make(chan AppendEntryRPCResponse, numOfPeers-1)
 
+	// take lock and prepare custom msgs for each follower
+	appendEntriesArgs := rf.getAppendEntriesArgs(numOfPeers, myTerm, myID)
+
 	// call RPCs
 	for i := 0; i < numOfPeers; i++ {
 		if i != myID {
-			go rf.sendAppendEntriesRPC(chanReplies, i, AppendEntriesArgs{myTerm, myID}, &AppendEntriesReply{Null, false})
+			go rf.sendAppendEntriesRPC(chanReplies, i, appendEntriesArgs[i], &AppendEntriesReply{Null, false})
 		}
 	}
 
@@ -649,11 +831,12 @@ func (rf *Raft) sendHeartbeats(numOfPeers int, myTerm int, myID int, chanUpdated
 
 		numOfHeartbeatReplies++
 
-		printWarning(fmt.Sprintf("got hb response from %d in term %d: ok: %t, success: %t", response.server, response.reply.Term, response.ok, response.reply.Success))
+		// printWarning(fmt.Sprintf("got hb response from %d in term %d: ok: %t, success: %t", response.server, response.reply.Term, response.ok, response.reply.Success))
 
 		// if we receive a heartbeat message responging unsucessfully, update our term and become follower
 		if response.ok && !response.reply.Success {
 			chanUpdatedTerm <- response.reply.Term
+			break
 		}
 
 		// if all responses are read, end this thread
@@ -696,7 +879,14 @@ func (rf *Raft) periodicallySendHeartBeats(chanUpdatedTerm chan int, chanStop ch
 	}
 }
 
-// Note: I'm ignoring RequestVote RPCs in leader state
+// func getNewIntArray(len int, initVal int) []int {
+// 	arr := make([]int, len)
+// 	for i, _ := range arr {
+// 		arr[i] = initVal
+// 	}
+// 	return arr
+// }
+
 func (rf *Raft) beLeader() {
 
 	// set state
@@ -705,7 +895,12 @@ func (rf *Raft) beLeader() {
 	numOfPeers := len(rf.peers)
 	myTerm := rf.currentTerm
 	myID := rf.me
+	lastLogIndex := len(rf.log) - 1
 	rf.mu.Unlock()
+
+	// leader's volatile state
+	rf.nextIndex = getNewIntArray(numOfPeers, lastLogIndex+1)
+	rf.matchIndex = getNewIntArray(numOfPeers, 0)
 
 	// send RequestVote RPCs to all other servers
 	chanUpdatedTerm := make(chan int)
@@ -784,10 +979,35 @@ func (rf *Raft) beLeader() {
 				chanStopHeartbeats <- true         // end the wait for ReqVote RPCs
 			}
 
+		case command := <-rf.chanNewCommand:
+			go rf.handleNewCommand(command)
+
 		}
 
 		if exitLeaderState {
 			break
 		}
 	}
+}
+
+func (rf *Raft) handleNewCommand(command interface{}) {
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	// add to local log
+	rf.log = append(rf.log, Log{len(rf.log), rf.currentTerm, command})
+
+	// modify appendEntries to send
+
+	// lastLogIndex := len(rf.log)
+	// for i, _ := range rf.nextIndex {
+	// 	if i == rf.me {
+	// 		continue
+	// 	}
+	// 	if lastLogIndex >= rf.nextIndex[i] {
+	// 		// send append entries to this shit
+	// 	}
+	// }
+
 }
