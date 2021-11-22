@@ -2,8 +2,10 @@ package raft
 
 /*
 TO-DOS:
-1. Persist state whenever you change it
-2. rf.applyCommittedEntriesToStateMachine()
+- Implement rf.applyNewCommitsToStateMachine()
+- Candidate & Leader main change karo append entries ka reply mechanism
+- RequestRPCs theek karo in both sending, and replying (in all follower, candidate, leader)
+- Persist state whenever you change it
 */
 
 //
@@ -306,8 +308,8 @@ func (rf *Raft) initializeServerVars() {
 	rf.isLeader = false
 
 	// volatile state
-	rf.commitIndex = 0
-	rf.lastApplied = 0
+	rf.commitIndex = -1
+	rf.lastApplied = -1
 
 	// note: leader volatile state will be initialized when server becomes leader
 
@@ -400,7 +402,7 @@ func (rf *Raft) getAppendEntriesReply(args AppendEntriesArgs) AppendEntriesReply
 			// if there is committable entries, commit them and pass them to state machine
 			if args.LeaderCommit > rf.commitIndex {
 				rf.commitNewEntries(args.LeaderCommit)
-				rf.applyCommittedEntriesToStateMachine()
+				rf.applyNewCommitsToStateMachine()
 			}
 			reply.Success = true
 		}
@@ -784,11 +786,13 @@ func (rf *Raft) getEntriesForServer(i int) []Log {
 	return entries_deep_copy
 }
 
-func (rf *Raft) getAppendEntriesArgs(numOfPeers int, myTerm int, myID int) []AppendEntriesArgs {
+func (rf *Raft) getAppendEntriesArgs(numOfPeers int, myTerm int, myID int) ([]AppendEntriesArgs, int) {
 
 	appendEntriesArgs := make([]AppendEntriesArgs, numOfPeers)
 
 	rf.mu.Lock()
+
+	logLength := len(rf.log)
 
 	for i, _ := range appendEntriesArgs {
 		if i != myID {
@@ -805,7 +809,7 @@ func (rf *Raft) getAppendEntriesArgs(numOfPeers int, myTerm int, myID int) []App
 
 	rf.mu.Unlock()
 
-	return appendEntriesArgs
+	return appendEntriesArgs, logLength
 }
 
 func (rf *Raft) sendHeartbeats(numOfPeers int, myTerm int, myID int, chanUpdatedTerm chan int) {
@@ -814,7 +818,7 @@ func (rf *Raft) sendHeartbeats(numOfPeers int, myTerm int, myID int, chanUpdated
 	chanReplies := make(chan AppendEntryRPCResponse, numOfPeers-1)
 
 	// take lock and prepare custom msgs for each follower
-	appendEntriesArgs := rf.getAppendEntriesArgs(numOfPeers, myTerm, myID)
+	appendEntriesArgs, logLength := rf.getAppendEntriesArgs(numOfPeers, myTerm, myID)
 
 	// call RPCs
 	for i := 0; i < numOfPeers; i++ {
@@ -833,10 +837,32 @@ func (rf *Raft) sendHeartbeats(numOfPeers int, myTerm int, myID int, chanUpdated
 
 		// printWarning(fmt.Sprintf("got hb response from %d in term %d: ok: %t, success: %t", response.server, response.reply.Term, response.ok, response.reply.Success))
 
-		// if we receive a heartbeat message responging unsucessfully, update our term and become follower
-		if response.ok && !response.reply.Success {
-			chanUpdatedTerm <- response.reply.Term
-			break
+		// check if hearbeat was okay
+		if response.ok {
+			if response.reply.Success {
+				// update nextIndex
+				nextIndexToPoint := logLength
+				rf.nextIndex[response.server] = nextIndexToPoint
+				// update matchIndex
+				rf.matchIndex[response.server] = nextIndexToPoint - 1
+				// update commit index if logs are replicated in a majority qourum and log is in our current term
+				rf.updateCommitIndex(numOfPeers)
+				// apply new commits to our state machine
+				rf.applyNewCommitsToStateMachine()
+			} else {
+				// if the unsuccess is due to higher term leader
+				if rf.currentTerm < response.reply.Term {
+					// update our term and become follower
+					chanUpdatedTerm <- response.reply.Term
+					break
+				} else
+				// if the unsuccess is due to log inconsistency with the follower
+				{
+					// decrement nextindex
+					rf.nextIndex[response.server]--
+				}
+			}
+
 		}
 
 		// if all responses are read, end this thread
@@ -844,6 +870,34 @@ func (rf *Raft) sendHeartbeats(numOfPeers int, myTerm int, myID int, chanUpdated
 			break
 		}
 	}
+}
+
+func (rf *Raft) updateCommitIndex(numOfPeers int) {
+	// If there exists an N such that N > commitIndex, a majority
+	// of matchIndex[i] ≥ N, and log[N].term == currentTerm:
+	// set commitIndex = N (§5.3, §5.4).
+	for N := len(rf.log) - 1; N > rf.commitIndex; N-- {
+		if N > rf.commitIndex {
+			// check if the log[N].term == currentTerm
+			if rf.log[N].term == rf.currentTerm {
+				// check if majority servers has the log replicated
+				if rf.doMajorityServersHaveLogReplicated(N, numOfPeers) {
+					rf.commitIndex = N
+					break
+				}
+			}
+		}
+	}
+}
+
+func (rf *Raft) doMajorityServersHaveLogReplicated(N, numOfPeers int) bool {
+	numOfServersWithLogStored := 1
+	for i, _ := range rf.matchIndex {
+		if i != rf.me && rf.matchIndex[i] >= N {
+			numOfServersWithLogStored++
+		}
+	}
+	return numOfServersWithLogStored >= numOfPeers/2
 }
 
 func (rf *Raft) periodicallySendHeartBeats(chanUpdatedTerm chan int, chanStop chan bool, numOfPeers int, myTerm int, myID int) {
@@ -879,13 +933,13 @@ func (rf *Raft) periodicallySendHeartBeats(chanUpdatedTerm chan int, chanStop ch
 	}
 }
 
-// func getNewIntArray(len int, initVal int) []int {
-// 	arr := make([]int, len)
-// 	for i, _ := range arr {
-// 		arr[i] = initVal
-// 	}
-// 	return arr
-// }
+func getNewIntArray(len int, initVal int) []int {
+	arr := make([]int, len)
+	for i, _ := range arr {
+		arr[i] = initVal
+	}
+	return arr
+}
 
 func (rf *Raft) beLeader() {
 
@@ -900,7 +954,7 @@ func (rf *Raft) beLeader() {
 
 	// leader's volatile state
 	rf.nextIndex = getNewIntArray(numOfPeers, lastLogIndex+1)
-	rf.matchIndex = getNewIntArray(numOfPeers, 0)
+	rf.matchIndex = getNewIntArray(numOfPeers, -1)
 
 	// send RequestVote RPCs to all other servers
 	chanUpdatedTerm := make(chan int)
