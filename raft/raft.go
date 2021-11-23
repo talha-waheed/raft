@@ -89,11 +89,13 @@ type Raft struct {
 	matchIndex []int
 
 	// channels to recieve information from RPCs
-	chanAppendEntriesArgs  chan AppendEntriesArgs
-	chanAppendEntriesReply chan AppendEntriesReply
-	chanRequestVoteArgs    chan RequestVoteArgs
-	chanRequestVoteReply   chan RequestVoteReply
-	chanNewCommand         chan interface{}
+	appendEntriesArgsCh     chan AppendEntriesArgs
+	appendEntriesReplyCh    chan AppendEntriesReply
+	requestVoteArgsCh       chan RequestVoteArgs
+	requestVoteReplyCh      chan RequestVoteReply
+	notifyNewCmdCh          chan interface{}
+	kickStartApplyEntriesCh chan int
+	applyCh                 chan ApplyMsg
 }
 
 // return currentTerm and whether this server
@@ -156,10 +158,10 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 	// send the rpc request over to the follower/candidate/leader go routine running rn
-	rf.chanRequestVoteArgs <- args
+	rf.requestVoteArgsCh <- args
 
 	// it will examine server states and reply with the reply
-	replyFromChan := <-rf.chanRequestVoteReply
+	replyFromChan := <-rf.requestVoteReplyCh
 
 	// send the reply received back
 	reply.Term = replyFromChan.Term
@@ -204,10 +206,10 @@ type AppendEntriesReply struct {
 func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) {
 
 	// send the rpc request over to the follower/candidate/leader go routine running rn
-	rf.chanAppendEntriesArgs <- args
+	rf.appendEntriesArgsCh <- args
 
 	// it will examine server states and reply with the reply
-	replyFromChan := <-rf.chanAppendEntriesReply
+	replyFromChan := <-rf.appendEntriesReplyCh
 
 	// send the reply received back
 	reply.Success = replyFromChan.Success
@@ -252,7 +254,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 func (rf *Raft) addToRaftLog(command interface{}) {
 	// inform leader that there is a new command
-	rf.chanNewCommand <- command
+	rf.notifyNewCmdCh <- command
 }
 
 //
@@ -282,9 +284,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
+	rf.applyCh = applyCh
 
 	// initialize our state variables
-	rf.initializeServerVars()
+	rf.initializeServerVars(applyCh)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -295,7 +298,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	return rf
 }
 
-func (rf *Raft) initializeServerVars() {
+func (rf *Raft) initializeServerVars(applyCh chan ApplyMsg) {
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -314,12 +317,12 @@ func (rf *Raft) initializeServerVars() {
 	// note: leader volatile state will be initialized when server becomes leader
 
 	// chans for communication
-	rf.chanAppendEntriesArgs = make(chan AppendEntriesArgs)
-	rf.chanAppendEntriesReply = make(chan AppendEntriesReply)
-	rf.chanRequestVoteArgs = make(chan RequestVoteArgs)
-	rf.chanRequestVoteReply = make(chan RequestVoteReply)
-	rf.chanNewCommand = make(chan interface{})
-
+	rf.appendEntriesArgsCh = make(chan AppendEntriesArgs)
+	rf.appendEntriesReplyCh = make(chan AppendEntriesReply)
+	rf.requestVoteArgsCh = make(chan RequestVoteArgs)
+	rf.requestVoteReplyCh = make(chan RequestVoteReply)
+	rf.notifyNewCmdCh = make(chan interface{})
+	rf.kickStartApplyEntriesCh = make(chan int)
 }
 
 func printWarning(toPrint string) {
@@ -354,6 +357,40 @@ func (rf *Raft) changeServerStateTo(newServerState string) {
 
 func getRandomTimeoutInterval() time.Duration {
 	return time.Duration(rand.Intn(MaxTimeout-MinTimeout)+MinTimeout) * time.Millisecond
+}
+
+func (rf *Raft) applyToStateMachine() {
+	// this is a persistent go routine kick started by rf.kickStartApplyEntriesCh
+
+	for {
+		// wait for this func to be kickstarted
+		<-rf.kickStartApplyEntriesCh
+
+		// obtain lock and get a copy of logs to apply
+		rf.mu.Lock()
+		logsToApply_shallow := rf.log[rf.lastApplied : rf.commitIndex+1]
+		logsToApply := make([]Log, len(logsToApply_shallow))
+		copy(logsToApply, logsToApply_shallow)
+		rf.mu.Unlock()
+
+		// apply all unapplied logs in order
+		for _, log := range logsToApply {
+			rf.applyCh <- ApplyMsg{
+				Index:   log.index,
+				Command: log.command,
+			}
+		}
+	}
+}
+
+func (rf *Raft) applyNewCommitsToStateMachine() {
+	// the lock should be acquired before calling this function
+
+	// see if we have committed entries that are not yet applied
+	if rf.lastApplied < rf.commitIndex {
+		// kick the go routine to apply uncommitted entries
+		rf.kickStartApplyEntriesCh <- 0
+	}
 }
 
 func (rf *Raft) getAppendEntriesReply(args AppendEntriesArgs) AppendEntriesReply {
@@ -540,7 +577,7 @@ func (rf *Raft) beFollower() {
 			rf.changeServerStateTo("candidate") // become a candidate
 
 		// if we get a heartbeat
-		case args := <-rf.chanAppendEntriesArgs:
+		case args := <-rf.appendEntriesArgsCh:
 
 			// reply to append entries
 			reply := rf.getAppendEntriesReply(args)
@@ -564,10 +601,10 @@ func (rf *Raft) beFollower() {
 			}
 
 		// reply to requestVoteRPCs
-		case args := <-rf.chanRequestVoteArgs:
+		case args := <-rf.requestVoteArgsCh:
 
 			reply := rf.getRequestVoteReply(args)
-			rf.chanRequestVoteReply <- RequestVoteReply{reply.Term, reply.VoteGranted}
+			rf.requestVoteReplyCh <- RequestVoteReply{reply.Term, reply.VoteGranted}
 
 			// if legitimate heartbeat
 			if reply.VoteGranted {
@@ -700,11 +737,11 @@ func (rf *Raft) beCandidate() {
 			chanCancelElection <- true          // end the wait for ReqVote RPCs
 
 		// we have discovered a leader's heartbeat
-		case args := <-rf.chanAppendEntriesArgs:
+		case args := <-rf.appendEntriesArgsCh:
 
 			// reply to append entries
 			reply := rf.getAppendEntriesReply(args)
-			rf.chanAppendEntriesReply <- AppendEntriesReply{reply.Term, reply.Success}
+			rf.appendEntriesReplyCh <- AppendEntriesReply{reply.Term, reply.Success}
 
 			// if the leader is legitimate
 			if reply.Success {
@@ -728,10 +765,10 @@ func (rf *Raft) beCandidate() {
 			chanCancelElection <- true         // end the wait for ReqVote RPCs
 
 		// reply to requestVoteRPCs
-		case args := <-rf.chanRequestVoteArgs:
+		case args := <-rf.requestVoteArgsCh:
 
 			reply := rf.getRequestVoteReply(args)
-			rf.chanRequestVoteReply <- RequestVoteReply{reply.Term, reply.VoteGranted}
+			rf.requestVoteReplyCh <- RequestVoteReply{reply.Term, reply.VoteGranted}
 
 			if reply.VoteGranted && reply.Term > myTerm {
 				// STATE TRANSITION: candidate -> follower
@@ -981,11 +1018,11 @@ func (rf *Raft) beLeader() {
 			chanStopHeartbeats <- true
 
 		// if the leader gets a heartbeat
-		case args := <-rf.chanAppendEntriesArgs:
+		case args := <-rf.appendEntriesArgsCh:
 
 			// reply to append entries
 			reply := rf.getAppendEntriesReply(args)
-			rf.chanAppendEntriesReply <- AppendEntriesReply{reply.Term, reply.Success}
+			rf.appendEntriesReplyCh <- AppendEntriesReply{reply.Term, reply.Success}
 
 			// if the leader is legitimate
 			if reply.Success {
@@ -1015,10 +1052,10 @@ func (rf *Raft) beLeader() {
 			chanStopHeartbeats <- true         // end the wait for ReqVote RPCs
 
 		// reply to requestVoteRPCs
-		case args := <-rf.chanRequestVoteArgs:
+		case args := <-rf.requestVoteArgsCh:
 
 			reply := rf.getRequestVoteReply(args)
-			rf.chanRequestVoteReply <- RequestVoteReply{reply.Term, reply.VoteGranted}
+			rf.requestVoteReplyCh <- RequestVoteReply{reply.Term, reply.VoteGranted}
 
 			if reply.VoteGranted && reply.Term > myTerm {
 
@@ -1033,7 +1070,7 @@ func (rf *Raft) beLeader() {
 				chanStopHeartbeats <- true         // end the wait for ReqVote RPCs
 			}
 
-		case command := <-rf.chanNewCommand:
+		case command := <-rf.notifyNewCmdCh:
 			go rf.handleNewCommand(command)
 
 		}
