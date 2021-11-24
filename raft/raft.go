@@ -6,6 +6,7 @@ TO-DOS:
 -- Candidate & Leader main change karo append entries ka reply mechanism
 - RequestRPCs theek karo in both sending, and replying (in all follower, candidate, leader)
 - Persist state whenever you change it
+- kill function implement
 */
 
 //
@@ -45,6 +46,10 @@ const MaxTimeout = 600
 // heartbeat interval
 const HeartbeatInterval = time.Second / 10
 
+// interval to periodically check for committable entries
+const CheckCommittableInterval = time.Second / 10
+
+// Null value for vote granted
 const Null int = -1
 
 type Log struct {
@@ -97,6 +102,10 @@ type Raft struct {
 	notifyNewCmdCh          chan interface{}
 	kickStartApplyEntriesCh chan int
 	applyCh                 chan ApplyMsg
+
+	// chans to end raft
+	endApplyToStateMachineCh chan bool
+	endRaft                  chan bool
 }
 
 // return currentTerm and whether this server
@@ -208,7 +217,7 @@ type AppendEntriesReply struct {
 
 func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) {
 
-	// // fmt.Println("args AppendEntries", args)
+	// // // fmt.Println("args AppendEntries", args)
 
 	// send the rpc request over to the follower/candidate/leader go routine running rn
 	rf.appendEntriesArgsCh <- args
@@ -266,6 +275,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 //
 func (rf *Raft) Kill() {
 	// Your code here, if desired.
+
+	rf.endApplyToStateMachineCh <- true
+	rf.endRaft <- true
 }
 
 //
@@ -331,10 +343,14 @@ func (rf *Raft) initializeServerVars(applyCh chan ApplyMsg) {
 	rf.requestVoteReplyCh = make(chan RequestVoteReply)
 	rf.notifyNewCmdCh = make(chan interface{})
 	rf.kickStartApplyEntriesCh = make(chan int)
+
+	// chans to end go routines
+	rf.endApplyToStateMachineCh = make(chan bool)
+	rf.endRaft = make(chan bool)
 }
 
 func printWarning(toPrint string) {
-	// // fmt.Println("Warning: " + toPrint)
+	// // // fmt.Println("Warning: " + toPrint)
 }
 
 func (rf *Raft) startServerState() {
@@ -368,53 +384,10 @@ func getRandomTimeoutInterval() time.Duration {
 	return time.Duration(rand.Intn(MaxTimeout-MinTimeout)+MinTimeout) * time.Millisecond
 }
 
-func (rf *Raft) applyToStateMachine() {
-	// this is a persistent go routine kick started by rf.kickStartApplyEntriesCh
-
-	for {
-		// wait for this func to be kickstarted
-		<-rf.kickStartApplyEntriesCh
-
-		// obtain lock
-		rf.mu.Lock()
-
-		// if we have no commmitted entries that need to be applied, continue on
-		if rf.lastApplied >= rf.commitIndex {
-			// fmt.Println("nahi kia in", rf.me, rf.lastApplied, rf.commitIndex)
-			rf.mu.Unlock()
-			continue
-		}
-
-		// get a copy of logs to apply
-		logsToApply := rf.log[max(1, rf.lastApplied) : rf.commitIndex+1]
-		// logsToApply := make([]Log, len(logsToApplyShallow))
-		// copy(logsToApply, logsToApplyShallow)
-
-		// update lastApplied
-		rf.lastApplied = rf.commitIndex
-
-		// release lock
-		rf.mu.Unlock()
-
-		// apply all unapplied logs in order
-		for _, log := range logsToApply {
-			rf.applyCh <- ApplyMsg{
-				Index:   log.Index,
-				Command: log.Command,
-			}
-		}
-
-		// fmt.Println("updated state in", rf.me, "cI:", rf.commitIndex, "lA:", rf.lastApplied, "log:", rf.log)
-		// fmt.Println(rf.me, ":", rf.commitIndex, rf.lastApplied, rf.log)
-
-		// fmt.Println("kardia", logsToApply, "in", rf.me)
-	}
-}
-
 func (rf *Raft) applyNewCommitsToStateMachine() {
-	// fmt.Println("xxx")
+	// // fmt.Println("xxx")
 	rf.kickStartApplyEntriesCh <- 0
-	// fmt.Println("yyy")
+	// // fmt.Println("yyy")
 }
 
 func (rf *Raft) getAppendEntriesReply(args AppendEntriesArgs) (AppendEntriesReply, bool) {
@@ -423,7 +396,7 @@ func (rf *Raft) getAppendEntriesReply(args AppendEntriesArgs) (AppendEntriesRepl
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	// // fmt.Println("args getAppendEntriesReply", args)
+	// // // fmt.Println("args getAppendEntriesReply", args)
 
 	reply := AppendEntriesReply{}
 	isHeartbeatValid := false
@@ -435,7 +408,8 @@ func (rf *Raft) getAppendEntriesReply(args AppendEntriesArgs) (AppendEntriesRepl
 		reply.Success = false
 		// and tell leader to update its term to rf.currentTerm
 		reply.Term = rf.currentTerm
-		// // fmt.Printf("Reject appEntry %d %d leaderid: %d\n", args.Term, rf.currentTerm, args.LeaderId)
+		// // // fmt.Printf("Reject appEntry %d %d leaderid: %d\n", args.Term, rf.currentTerm, args.LeaderId)
+		// fmt.Println(rf.me, ":", rf.commitIndex, rf.lastApplied, "(AE from", args.LeaderId, ": rejected lT < cT (", args.Term, "<", rf.currentTerm, "))")
 	} else {
 		// if this is the same or greater term, then this is the new leader, iski bait karo
 		// inform leader that we agree to it being the leader
@@ -443,6 +417,7 @@ func (rf *Raft) getAppendEntriesReply(args AppendEntriesArgs) (AppendEntriesRepl
 		reply.Success = true
 		reply.Term = args.Term
 		// change our term to conform to the leader
+		// fmt.Println(rf.me, ":", rf.commitIndex, rf.lastApplied, "(AE: cT changed from", rf.currentTerm, "to", args.Term, ")")
 		rf.currentTerm = args.Term
 		// if we had vote for anyone, clear it. We are beyond candidate state
 		rf.votedFor = Null
@@ -460,10 +435,11 @@ func (rf *Raft) getAppendEntriesReply(args AppendEntriesArgs) (AppendEntriesRepl
 		// if len(args.Entries) > 0 {
 		// ensure prev log is same, else reject it
 		if !rf.isPrevLogSame(args.PrevLogIndex, args.PrevLogTerm) {
-			// // // fmt.Printf("Not same %d %d\n", args.PrevLogIndex, args.PrevLogTerm)
+			// // // // fmt.Printf("Not same %d %d\n", args.PrevLogIndex, args.PrevLogTerm)
 			reply.Success = false
+			// fmt.Println(rf.me, ":", rf.commitIndex, rf.lastApplied, rf.log, "(prev not same: rejected heartbeat from leader)")
 		} else {
-			// // fmt.Println("going to add log from leader in", rf.me, rf.commitIndex, rf.log)
+			// // // fmt.Println("going to add log from leader in", rf.me, rf.commitIndex, rf.log)
 			// add the new entries to local log
 			rf.addEntriesFromLeaderToLog(args)
 			// if there is committable entries, commit them and pass them to state machine
@@ -474,7 +450,7 @@ func (rf *Raft) getAppendEntriesReply(args AppendEntriesArgs) (AppendEntriesRepl
 				}
 			}
 			reply.Success = true
-			// fmt.Println("added log from leader in", rf.me, "commitIndex:", rf.commitIndex, "log:", rf.log)
+			// // fmt.Println("added log from leader in", rf.me, "commitIndex:", rf.commitIndex, "log:", rf.log)
 		}
 		// }
 
@@ -502,14 +478,14 @@ func (rf *Raft) addEntriesFromLeaderToLog(args AppendEntriesArgs) {
 
 	// prune log until previndex
 	prunedLogSlice := rf.log[:args.PrevLogIndex+1]
-	prunedLogDeepSlice := make([]Log, len(prunedLogSlice))
-	copy(prunedLogDeepSlice, prunedLogSlice)
-	rf.log = prunedLogDeepSlice
+	// prunedLogDeepSlice := make([]Log, len(prunedLogSlice))
+	// copy(prunedLogDeepSlice, prunedLogSlice)
+	rf.log = prunedLogSlice
 
 	// add entries ahead of it
 	rf.log = append(prunedLogSlice, args.Entries...)
 
-	// fmt.Println(rf.me, ":", rf.commitIndex, rf.lastApplied, rf.log, "(added log(s))")
+	// fmt.Println(rf.me, ":", rf.commitIndex, rf.lastApplied, rf.log, "(added", args.Entries, "from leader in heartbeat)")
 }
 
 func (rf *Raft) isPrevLogSame(prevLogIndex int, prevLogTerm int) bool {
@@ -565,10 +541,15 @@ func (rf *Raft) getRequestVoteReply(args RequestVoteArgs) RequestVoteReply {
 			rf.currentTerm = args.Term
 			rf.votedFor = args.CandidateId
 
+			// fmt.Println(rf.me, ":", rf.commitIndex, rf.lastApplied, "(RV: cT changed from", rf.currentTerm, "to", args.Term, ")")
+
 			// rf.persist()
 		} else {
 			reply.Term = args.Term
 			reply.VoteGranted = false
+
+			rf.currentTerm = args.Term
+			rf.votedFor = Null
 		}
 
 	} else {
@@ -591,6 +572,8 @@ func (rf *Raft) getRequestVoteReply(args RequestVoteArgs) RequestVoteReply {
 			// // note that earlier I was not changing our term here,
 			rf.votedFor = args.CandidateId
 			rf.currentTerm = max(args.Term, rf.currentTerm)
+
+			// fmt.Println(rf.me, ":", rf.commitIndex, rf.lastApplied, "(RV: cT changed from", rf.currentTerm, "to", args.Term, ")")
 
 			// rf.persist()
 		} else {
@@ -626,6 +609,10 @@ func (rf *Raft) beFollower() {
 
 		select {
 
+		// if raft server has been killed
+		case <-rf.endRaft:
+			exitFollowerState = true
+
 		// if heartbeat times out
 		case <-heartbeatTimer.C:
 			// STATE TRANSITION: follower -> candidate
@@ -636,7 +623,7 @@ func (rf *Raft) beFollower() {
 		// if we get a heartbeat
 		case args := <-rf.appendEntriesArgsCh:
 
-			// // fmt.Println("args beFollower", args)
+			// // // fmt.Println("args beFollower", args)
 
 			// reply to append entries
 			reply, isHeartbeatValid := rf.getAppendEntriesReply(args)
@@ -754,7 +741,6 @@ func (rf *Raft) callReqVoteRPCs(chanHasWonElection chan bool, chanUpdatedTerm ch
 	}
 }
 
-// Note: I'm ignoring RequestVote RPCs in candidate state
 func (rf *Raft) beCandidate() {
 
 	// start leader election
@@ -783,6 +769,10 @@ func (rf *Raft) beCandidate() {
 
 	for {
 		select {
+
+		// if raft server has been killed
+		case <-rf.endRaft:
+			exitCandidateState = true
 
 		// we have won election
 		case <-chanHasWonElection:
@@ -822,6 +812,7 @@ func (rf *Raft) beCandidate() {
 			// update our term
 			rf.mu.Lock()
 			rf.currentTerm = updatedTerm // vote for self
+			// fmt.Println(rf.me, ":", rf.commitIndex, rf.lastApplied, "(RV_Reply: cT changed from", rf.currentTerm, "to", updatedTerm, ")")
 			// rf.persist()
 			rf.mu.Unlock()
 
@@ -859,23 +850,16 @@ type AppendEntryRPCResponse struct {
 
 // wrapper func around sendAppendEntries(...) to receive RPC reply in a channel
 func (rf *Raft) sendAppendEntriesRPC(chanReplies chan AppendEntryRPCResponse, server int, args AppendEntriesArgs, reply *AppendEntriesReply) {
-	// // fmt.Println("appendEntriesArg[i] is", args)
+	// // // fmt.Println("appendEntriesArg[i] is", args)
 	ok := rf.sendAppendEntries(server, args, reply)
 	chanReplies <- AppendEntryRPCResponse{ok, AppendEntriesReply{reply.Term, reply.Success}, server}
 }
 
-func (rf *Raft) getLogTerm(i int) int {
-	if i > len(rf.log)-1 {
-		printWarning(fmt.Sprintf("Trying to get log at index %d i.e. out of range", i))
-		return rf.log[i].Term
-	} else if i < -1 {
-		printWarning(fmt.Sprintf("Trying to get log at index %d", i))
-		return -1
-	} else if i == -1 {
-		return -1
-	} else {
-		return rf.log[i].Term
+func (rf *Raft) getLog(i int) Log {
+	if i < 0 {
+		return rf.log[0]
 	}
+	return rf.log[i]
 }
 
 func (rf *Raft) getEntriesForServer(i int) []Log {
@@ -898,15 +882,15 @@ func (rf *Raft) getAppendEntriesArgs(numOfPeers int, myTerm int, myID int) ([]Ap
 
 	logLength := len(rf.log)
 
-	// // fmt.Println("In getAppendEntriesArgs", rf.nextIndex)
+	// // // fmt.Println("In getAppendEntriesArgs", rf.nextIndex)
 
 	for i, _ := range appendEntriesArgs {
 		if i != myID {
 			appendEntriesArgs[i] = AppendEntriesArgs{
 				Term:         myTerm,
 				LeaderId:     myID,
-				PrevLogIndex: rf.log[rf.nextIndex[i]-1].Index,
-				PrevLogTerm:  rf.log[rf.nextIndex[i]-1].Term,
+				PrevLogIndex: rf.getLog(rf.nextIndex[i] - 1).Index,
+				PrevLogTerm:  rf.getLog(rf.nextIndex[i] - 1).Term,
 				Entries:      rf.getEntriesForServer(i),
 				LeaderCommit: rf.commitIndex,
 			}
@@ -930,7 +914,7 @@ func (rf *Raft) handleHeartbeatSuccess(response AppendEntryRPCResponse, logLengt
 	// update matchIndex
 	rf.matchIndex[response.server] = nextIndexToPoint - 1
 
-	// fmt.Println("updated state", rf.matchIndex, rf.nextIndex)
+	// // fmt.Println("updated state", rf.matchIndex, rf.nextIndex)
 
 	// update commit index if logs are replicated in a majority qourum and log is in our current term
 	rf.updateCommitIndex(numOfPeers)
@@ -950,7 +934,7 @@ func (rf *Raft) handleHeartbeatFailure(response AppendEntryRPCResponse) bool {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	// // fmt.Printf("handleHeartbeatFailure %d %d\n", rf.currentTerm, response.reply.Term)
+	// // // fmt.Printf("handleHeartbeatFailure %d %d\n", rf.currentTerm, response.reply.Term)
 
 	// if the unsuccess is due to higher term leader, we need to fall back to follower
 	if rf.currentTerm < response.reply.Term {
@@ -962,7 +946,7 @@ func (rf *Raft) handleHeartbeatFailure(response AppendEntryRPCResponse) bool {
 	} else
 	// if the unsuccess is due to log inconsistency with the follower
 	{
-		// // fmt.Println("going to decrement")
+		// // // fmt.Println("going to decrement")
 		// decrement nextindex
 		rf.nextIndex[response.server]--
 
@@ -980,14 +964,14 @@ func (rf *Raft) sendHeartbeats(numOfPeers int, myTerm int, myID int, chanUpdated
 	// take lock and prepare custom msgs for each follower
 	appendEntriesArgs, logLength := rf.getAppendEntriesArgs(numOfPeers, myTerm, myID)
 
-	// // fmt.Println(appendEntriesArgs)
+	// // // fmt.Println(appendEntriesArgs)
 
-	// // fmt.Println("leaderid is", myID)
+	// // // fmt.Println("leaderid is", myID)
 
 	// call RPCs
 	for i := 0; i < numOfPeers; i++ {
 		if i != myID {
-			// // // fmt.Println("appendEntriesArg[i] is", appendEntriesArgs[i])
+			// // // // fmt.Println("appendEntriesArg[i] is", appendEntriesArgs[i])
 			// a := appendEntriesArgs[i]
 			go rf.sendAppendEntriesRPC(chanReplies, i, AppendEntriesArgs{appendEntriesArgs[i].Term, appendEntriesArgs[i].LeaderId, appendEntriesArgs[i].PrevLogIndex, appendEntriesArgs[i].PrevLogTerm, appendEntriesArgs[i].Entries, appendEntriesArgs[i].LeaderCommit}, &AppendEntriesReply{Null, false})
 		}
@@ -1020,7 +1004,7 @@ func (rf *Raft) sendHeartbeats(numOfPeers int, myTerm int, myID int, chanUpdated
 				fallBackToFollower := rf.handleHeartbeatFailure(response)
 
 				if fallBackToFollower {
-					// // // fmt.Println("fa")
+					// // // // fmt.Println("fa")
 					// send updated term to leader go routine and end this thread
 					chanUpdatedTerm <- response.reply.Term
 					break
@@ -1036,6 +1020,139 @@ func (rf *Raft) sendHeartbeats(numOfPeers int, myTerm int, myID int, chanUpdated
 	}
 }
 
+func (rf *Raft) applyToStateMachine() {
+	// this is a persistent go routine kick started by rf.kickStartApplyEntriesCh
+
+	exit := false
+
+	for {
+
+		select {
+
+		case <-rf.endApplyToStateMachineCh:
+			exit = true
+
+		case <-rf.kickStartApplyEntriesCh:
+
+			if len(rf.endApplyToStateMachineCh) > 0 {
+
+				<-rf.endApplyToStateMachineCh
+				exit = true
+
+			} else {
+
+				// obtain lock
+				rf.mu.Lock()
+
+				// if we have no commmitted entries that need to be applied, continue on
+				if rf.lastApplied >= rf.commitIndex {
+					// // fmt.Println("nahi kia in", rf.me, rf.lastApplied, rf.commitIndex)
+					rf.mu.Unlock()
+					continue
+				}
+
+				// get a copy of logs to apply
+				logsToApply := rf.log[max(1, rf.lastApplied) : rf.commitIndex+1]
+				// logsToApply := make([]Log, len(logsToApplyShallow))
+				// copy(logsToApply, logsToApplyShallow)
+
+				// update lastApplied
+				rf.lastApplied = rf.commitIndex
+
+				// to log
+				// cI := rf.commitIndex
+				// lA := rf.lastApplied
+				// log := rf.log
+				// me := rf.me
+
+				// release lock
+				rf.mu.Unlock()
+
+				// apply all unapplied logs in order
+				for _, log := range logsToApply {
+					rf.applyCh <- ApplyMsg{
+						Index:   log.Index,
+						Command: log.Command,
+					}
+				}
+
+				// // fmt.Println("updated state in", rf.me, "cI:", rf.commitIndex, "lA:", rf.lastApplied, "log:", rf.log)
+				// fmt.Println(me, ":", cI, lA, log, "(applied", logsToApply, "to state machine)")
+
+				// // fmt.Println("kardia", logsToApply, "in", rf.me)
+
+			}
+		}
+
+		if exit {
+			break
+		}
+
+	}
+}
+
+func (rf *Raft) periodicallyCheckForCommits(numOfPeers int, endCh chan bool) {
+
+	exit := false
+
+	for {
+
+		select {
+
+		case <-endCh:
+			exit = true
+
+		default:
+			rf.mu.Lock()
+
+			// update commit index if logs are replicated in a majority qourum and log is in our current term
+			rf.updateCommitIndex(numOfPeers)
+
+			// apply new commits to our state machine if there are any unapplied commits
+			if rf.lastApplied < rf.commitIndex {
+				// // kick application code in go routine as this can block
+				// go rf.applyNewCommitsToStateMachine()
+
+				// get a copy of logs to apply
+				logsToApplyShallow := rf.log[max(1, rf.lastApplied) : rf.commitIndex+1]
+				logsToApply := make([]Log, len(logsToApplyShallow))
+				copy(logsToApply, logsToApplyShallow)
+
+				// update lastApplied
+				rf.lastApplied = rf.commitIndex
+
+				// to log
+				// cI := rf.commitIndex
+				// lA := rf.lastApplied
+				// log := rf.log
+				// me := rf.me
+
+				// release lock
+				rf.mu.Unlock()
+
+				// apply all unapplied logs in order
+				for _, log := range logsToApply {
+					rf.applyCh <- ApplyMsg{
+						Index:   log.Index,
+						Command: log.Command,
+					}
+				}
+
+				// fmt.Println(me, ":", cI, lA, log, "(applied", logsToApply, " by leader to state machine)")
+
+			} else {
+				rf.mu.Unlock()
+			}
+		}
+
+		if exit {
+			break
+		}
+
+		time.Sleep(CheckCommittableInterval)
+	}
+}
+
 func (rf *Raft) updateCommitIndex(numOfPeers int) {
 	// If there exists an N such that N > commitIndex, a majority
 	// of matchIndex[i] ≥ N, and log[N].term == currentTerm:
@@ -1046,7 +1163,7 @@ func (rf *Raft) updateCommitIndex(numOfPeers int) {
 			if rf.log[N].Term == rf.currentTerm {
 				// check if majority servers has the log replicated
 				if rf.doMajorityServersHaveLogReplicated(N, numOfPeers) {
-					// // fmt.Println("committed", N, rf.matchIndex, rf.nextIndex)
+					// // // fmt.Println("committed", N, rf.matchIndex, rf.nextIndex)
 					rf.commitIndex = N
 					break
 				}
@@ -1122,7 +1239,7 @@ func (rf *Raft) beLeader() {
 
 	// leader's volatile state
 	rf.nextIndex = getNewIntArray(numOfPeers, lastLogIndex+1)
-	// // fmt.Println(rf.nextIndex)
+	// // // fmt.Println(rf.nextIndex)
 	rf.matchIndex = getNewIntArray(numOfPeers, 0)
 
 	// rf.persist()
@@ -1133,10 +1250,20 @@ func (rf *Raft) beLeader() {
 	chanStopHeartbeats := make(chan bool)
 	go rf.periodicallySendHeartBeats(chanUpdatedTerm, chanStopHeartbeats, numOfPeers, myTerm, myID)
 
+	// start go routine that periodically checks if entries can be committed
+	// endCheckCommitsCh := make(chan bool)
+	// go rf.periodicallyCheckForCommits(numOfPeers, endCheckCommitsCh)
+
 	exitLeaderState := false
 
 	for {
 		select {
+
+		// if raft server has been killed
+		case <-rf.endRaft:
+			exitLeaderState = true
+			chanStopHeartbeats <- true
+			// endCheckCommitsCh <- true
 
 		// discovers server with higher term through heartbeat replies
 		case newTerm := <-chanUpdatedTerm:
@@ -1144,6 +1271,7 @@ func (rf *Raft) beLeader() {
 			// change state
 			rf.mu.Lock()
 			rf.currentTerm = newTerm
+			// fmt.Println(rf.me, ":", rf.commitIndex, rf.lastApplied, "(AE_Reply: cT changed from", rf.currentTerm, "to", newTerm, ")")
 			rf.isLeader = false
 			// rf.persist()
 			rf.mu.Unlock()
@@ -1152,6 +1280,7 @@ func (rf *Raft) beLeader() {
 			rf.changeServerStateTo("follower")
 			exitLeaderState = true
 			chanStopHeartbeats <- true
+			// endCheckCommitsCh <- true
 
 		// if the leader gets a heartbeat
 		case args := <-rf.appendEntriesArgsCh:
@@ -1173,23 +1302,26 @@ func (rf *Raft) beLeader() {
 				rf.changeServerStateTo("follower")
 				exitLeaderState = true
 				chanStopHeartbeats <- true
+				// endCheckCommitsCh <- true
 			}
 
-		// we have discovered a higher term from a RequestVote RPC
-		case updatedTerm := <-chanUpdatedTerm:
+		// // we have discovered a higher term from a RequestVote RPC
+		// case updatedTerm := <-chanUpdatedTerm:
 
-			// update our term
-			rf.mu.Lock()
-			rf.currentTerm = updatedTerm // vote for self
-			// rf.persist()
-			rf.mu.Unlock()
+		// 	// update our term
+		// 	rf.mu.Lock()
+		// 	rf.currentTerm = updatedTerm // vote for self
+		// 	// fmt.Println(rf.me, ":", rf.commitIndex, rf.lastApplied, "(RV: cT changed from", rf.currentTerm, "to", updatedTerm, ")")
+		// 	// rf.persist()
+		// 	rf.mu.Unlock()
 
-			// fmt.Println("becoming follower from leader in", myID)
+		// 	// // fmt.Println("becoming follower from leader in", myID)
 
-			// STATE TRANSITION: candidate -> follower
-			rf.changeServerStateTo("follower") // become follower
-			exitLeaderState = true             // exit the candidate state
-			chanStopHeartbeats <- true         // end the wait for ReqVote RPCs
+		// 	// STATE TRANSITION: candidate -> follower
+		// 	rf.changeServerStateTo("follower") // become follower
+		// 	exitLeaderState = true             // exit the candidate state
+		// 	chanStopHeartbeats <- true         // end the wait for ReqVote RPCs
+		// 	endCheckCommitsCh <- true
 
 		// reply to requestVoteRPCs
 		case args := <-rf.requestVoteArgsCh:
@@ -1205,12 +1337,13 @@ func (rf *Raft) beLeader() {
 				// rf.persist()
 				rf.mu.Unlock()
 
-				// fmt.Println("becoming follower from leader in", myID)
+				// // fmt.Println("becoming follower from leader in", myID)
 
 				// STATE TRANSITION: candidate -> follower
 				rf.changeServerStateTo("follower") // become follower
 				exitLeaderState = true             // exit the candidate state
 				chanStopHeartbeats <- true         // end the wait for ReqVote RPCs
+				// endCheckCommitsCh <- true
 			}
 
 		}
