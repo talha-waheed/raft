@@ -392,8 +392,6 @@ func TestBackup(t *testing.T) {
 	fmt.Printf("  ... Passed\n")
 }
 
-
-
 func TestPersist1(t *testing.T) {
 	servers := 3
 	cfg := make_config(t, servers, false)
@@ -581,5 +579,3 @@ func TestFigure8(t *testing.T) {
 
 	fmt.Printf("  ... Passed\n")
 }
-
-

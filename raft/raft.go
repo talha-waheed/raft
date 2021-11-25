@@ -1,5 +1,10 @@
 package raft
 
+// 1. persists lagao
+// 2. use locks more conservatively
+// 3. independently chalao RPCs in go routine(s)
+// 4. run getRPC in RPC itself
+
 //
 // this is an outline of the API that raft must expose to
 // the service (or tester). see comments below for
@@ -724,7 +729,7 @@ func (rf *Raft) beCandidate() {
 			rf.appendEntriesReplyCh <- AppendEntriesReply{reply.Term, reply.Success}
 
 			// if the leader is legitimate
-			if isHeartbeatValid {
+			if isHeartbeatValid || reply.Term > myTerm {
 				// STATE TRANSITION: candidate -> follower
 				rf.changeServerStateTo("follower")
 				exitCandidateState = true
@@ -752,7 +757,7 @@ func (rf *Raft) beCandidate() {
 			reply := rf.getRequestVoteReply(args)
 			rf.requestVoteReplyCh <- RequestVoteReply{reply.Term, reply.VoteGranted}
 
-			if reply.VoteGranted && reply.Term > myTerm {
+			if reply.Term > myTerm { // && reply.VoteGranted {
 				// STATE TRANSITION: candidate -> follower
 				rf.changeServerStateTo("follower") // become follower
 				exitCandidateState = true          // exit the candidate state
@@ -899,15 +904,6 @@ func (rf *Raft) sendHeartbeats(numOfPeers int, myTerm int, myID int, chanUpdated
 			// a := appendEntriesArgs[i]
 			go rf.sendAppendEntriesRPC(chanReplies, i, AppendEntriesArgs{appendEntriesArgs[i].Term, appendEntriesArgs[i].LeaderId, appendEntriesArgs[i].PrevLogIndex, appendEntriesArgs[i].PrevLogTerm, appendEntriesArgs[i].Entries, appendEntriesArgs[i].LeaderCommit}, &AppendEntriesReply{Null, false})
 		}
-	}
-
-	type AppendEntriesArgs struct {
-		Term         int
-		LeaderId     int
-		PrevLogIndex int
-		PrevLogTerm  int
-		Entries      []Log
-		LeaderCommit int
 	}
 
 	numOfHeartbeatReplies := 1
@@ -1181,7 +1177,7 @@ func (rf *Raft) beLeader() {
 			rf.appendEntriesReplyCh <- AppendEntriesReply{reply.Term, reply.Success}
 
 			// if the leader is legitimate
-			if isHeartbeatValid {
+			if isHeartbeatValid || reply.Term > myTerm {
 
 				// change state
 				rf.mu.Lock()
@@ -1202,7 +1198,7 @@ func (rf *Raft) beLeader() {
 			reply := rf.getRequestVoteReply(args)
 			rf.requestVoteReplyCh <- RequestVoteReply{reply.Term, reply.VoteGranted}
 
-			if reply.VoteGranted && reply.Term > myTerm {
+			if reply.Term > myTerm { // && reply.VoteGranted {
 
 				// change state
 				rf.mu.Lock()
