@@ -74,11 +74,10 @@ type Raft struct {
 	me        int // index into peers[]
 
 	// persistent states
-	currentTerm  int
-	votedFor     int
-	log          []Log
-	isLeader     bool   // specific to this impl. of raft
-	currentState string // specific to this impl. of raft
+	currentTerm      int
+	votedFor         int
+	log              []Log
+	currentRaftState string // specific to this impl. of raft
 
 	// volatile states
 	commitIndex int
@@ -111,7 +110,7 @@ func (rf *Raft) GetState() (int, bool) {
 
 	rf.mu.Lock()
 	term = rf.currentTerm
-	isleader = rf.isLeader
+	isleader = rf.currentRaftState == "leader"
 	rf.mu.Unlock()
 
 	return term, isleader
@@ -128,8 +127,7 @@ func (rf *Raft) persist() {
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
 	e.Encode(rf.log)
-	e.Encode(rf.isLeader)
-	e.Encode(rf.currentState)
+	e.Encode(rf.currentRaftState)
 	data := w.Bytes()
 	rf.persister.SaveRaftState(data)
 }
@@ -143,8 +141,7 @@ func (rf *Raft) readPersist(data []byte) {
 	d.Decode(&rf.currentTerm)
 	d.Decode(&rf.votedFor)
 	d.Decode(&rf.log)
-	d.Decode(&rf.isLeader)
-	d.Decode(&rf.currentState)
+	d.Decode(&rf.currentRaftState)
 }
 
 type RequestVoteArgs struct {
@@ -247,11 +244,11 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.mu.Lock()
 	index = len(rf.log)
 	term = rf.currentTerm
-	isLeader = rf.isLeader
+	isLeader = rf.currentRaftState == "leader"
 	if isLeader {
 		rf.log = append(rf.log, Log{index, term, command})
 		// fmt.Println(rf.me, ":", rf.commitIndex, rf.lastApplied, rf.log, "(added to log at leader)")
-		// rf.persist()
+		rf.persist()
 	}
 	rf.mu.Unlock()
 
@@ -316,8 +313,7 @@ func (rf *Raft) initializeServerVars(applyCh chan ApplyMsg) {
 		Index: 0,
 		Term:  0,
 	})
-	rf.currentState = "follower"
-	rf.isLeader = false
+	rf.currentRaftState = "follower"
 
 	// volatile state
 	rf.commitIndex = 0
@@ -344,8 +340,7 @@ func printWarning(toPrint string) {
 
 func (rf *Raft) startServerState() {
 	rf.mu.Lock()
-	currentState := rf.currentState
-	// rf.persist()
+	currentState := rf.currentRaftState
 	rf.mu.Unlock()
 
 	rf.changeServerStateTo(currentState)
@@ -353,6 +348,11 @@ func (rf *Raft) startServerState() {
 
 // changes Raft's server state
 func (rf *Raft) changeServerStateTo(newServerState string) {
+
+	rf.mu.Lock()
+	rf.currentRaftState = newServerState
+	rf.persist()
+	rf.mu.Unlock()
 
 	if newServerState == "follower" {
 		go rf.beFollower()
@@ -427,7 +427,7 @@ func (rf *Raft) getAppendEntriesReply(args AppendEntriesArgs) (AppendEntriesRepl
 			// fmt.Println("added log from leader in", rf.me, "commitIndex:", rf.commitIndex, "log:", rf.log)
 		}
 
-		// rf.persist()
+		rf.persist()
 	}
 
 	// the calling function (beFollower, beCandidate, or beLeader) will alter its behavior by inspecting this reply
@@ -503,7 +503,6 @@ func (rf *Raft) getRequestVoteReply(args RequestVoteArgs) RequestVoteReply {
 
 			// fmt.Println(rf.me, ":", rf.commitIndex, rf.lastApplied, "(RV: cT changed from", rf.currentTerm, "to", args.Term, ")")
 
-			// rf.persist()
 		} else {
 			reply.Term = args.Term
 			reply.VoteGranted = false
@@ -512,6 +511,7 @@ func (rf *Raft) getRequestVoteReply(args RequestVoteArgs) RequestVoteReply {
 			rf.votedFor = Null
 		}
 
+		rf.persist()
 	}
 
 	// We have updated state variables in this function (rf.currentTerm and rf.votedFor).
@@ -525,9 +525,8 @@ func (rf *Raft) beFollower() {
 
 	// reset voted for before becoming a follower
 	rf.mu.Lock()
-	rf.isLeader = false
 	myID := rf.me
-	// rf.persist()
+	rf.persist()
 	rf.mu.Unlock()
 
 	// bool to break state's infinite for loop
@@ -677,12 +676,11 @@ func (rf *Raft) beCandidate() {
 
 	// initialize state
 	rf.mu.Lock()
-	rf.isLeader = false
 	rf.currentTerm++    // increment current term
 	rf.votedFor = rf.me // vote for self
 	myTerm := rf.currentTerm
 
-	// rf.persist()
+	rf.persist()
 	rf.mu.Unlock()
 
 	// send RequestVote RPCs to all other servers
@@ -708,7 +706,6 @@ func (rf *Raft) beCandidate() {
 		case <-chanHasWonElection:
 			// STATE TRANSITION: candidate -> leader
 			rf.mu.Lock()
-			rf.isLeader = true
 			// rf.persist()
 			rf.mu.Unlock()
 			rf.changeServerStateTo("leader")
@@ -743,7 +740,7 @@ func (rf *Raft) beCandidate() {
 			rf.mu.Lock()
 			rf.currentTerm = updatedTerm // vote for self
 			// fmt.Println(rf.me, ":", rf.commitIndex, rf.lastApplied, "(RV_Reply: cT changed from", rf.currentTerm, "to", updatedTerm, ")")
-			// rf.persist()
+			rf.persist()
 			rf.mu.Unlock()
 
 			// STATE TRANSITION: candidate -> follower
@@ -1116,7 +1113,6 @@ func (rf *Raft) beLeader() {
 
 	// set state
 	rf.mu.Lock()
-	rf.isLeader = true
 	numOfPeers := len(rf.peers)
 	myTerm := rf.currentTerm
 	myID := rf.me
@@ -1159,8 +1155,7 @@ func (rf *Raft) beLeader() {
 			rf.mu.Lock()
 			rf.currentTerm = newTerm
 			// fmt.Println(rf.me, ":", rf.commitIndex, rf.lastApplied, "(AE_Reply: cT changed from", rf.currentTerm, "to", newTerm, ")")
-			rf.isLeader = false
-			// rf.persist()
+			rf.persist()
 			rf.mu.Unlock()
 
 			// STATE TRANSITION: leader -> follower
@@ -1179,12 +1174,6 @@ func (rf *Raft) beLeader() {
 			// if the leader is legitimate
 			if isHeartbeatValid || reply.Term > myTerm {
 
-				// change state
-				rf.mu.Lock()
-				rf.isLeader = false
-				// rf.persist()
-				rf.mu.Unlock()
-
 				// STATE TRANSITION: leader -> follower
 				rf.changeServerStateTo("follower")
 				exitLeaderState = true
@@ -1199,12 +1188,6 @@ func (rf *Raft) beLeader() {
 			rf.requestVoteReplyCh <- RequestVoteReply{reply.Term, reply.VoteGranted}
 
 			if reply.Term > myTerm { // && reply.VoteGranted {
-
-				// change state
-				rf.mu.Lock()
-				rf.isLeader = false
-				// rf.persist()
-				rf.mu.Unlock()
 
 				// STATE TRANSITION: candidate -> follower
 				rf.changeServerStateTo("follower") // become follower
