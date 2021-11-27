@@ -311,7 +311,7 @@ func (rf *Raft) initializeServerVars(applyCh chan ApplyMsg) {
 	rf.log = make([]Log, 0)
 	rf.log = append(rf.log, Log{
 		Index: 0,
-		Term:  0,
+		Term:  Null,
 	})
 	rf.currentRaftState = "follower"
 
@@ -454,10 +454,10 @@ func (rf *Raft) addEntriesFromLeaderToLog(args AppendEntriesArgs) {
 
 func (rf *Raft) isPrevLogSame(prevLogIndex int, prevLogTerm int) bool {
 
-	// if there was no prevlog at the leader, return true
-	if prevLogIndex == 0 {
-		return true
-	}
+	// // if there was no prevlog at the leader, return true
+	// if prevLogIndex == 0 {
+	// 	return true
+	// }
 
 	// check if there is some entry at index == prevLogIndex
 	if len(rf.log) < prevLogIndex+1 {
