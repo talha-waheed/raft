@@ -223,6 +223,13 @@ func (rf *Raft) sendAppendEntries(server int, args AppendEntriesArgs, reply *App
 	return ok
 }
 
+func printMyID(me int, currentRaftState string) string {
+	if currentRaftState == "leader" {
+		return fmt.Sprintf("[%d]", me)
+	}
+	return fmt.Sprintf("%d", me)
+}
+
 //
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -247,7 +254,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader = rf.currentRaftState == "leader"
 	if isLeader {
 		rf.log = append(rf.log, Log{index, term, command})
-		// fmt.Println(rf.me, ":", rf.commitIndex, rf.lastApplied, rf.log, "(added to log at leader)")
+		// fmt.Println("s:", printMyID(rf.me, rf.currentRaftState), ": [add to log at leader] t:", rf.currentTerm, "cI:", rf.commitIndex, "lA:", rf.lastApplied, rf.log, "(added to log at leader)")
 		rf.persist()
 	}
 	rf.mu.Unlock()
@@ -291,7 +298,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
-	// start the server in the state persisted before crash (this doesn't block)
+	// start the server in the follower state (this doesn't block)
 	rf.startServerState()
 
 	// start a routine that can apply logs to state machine
@@ -335,21 +342,23 @@ func (rf *Raft) initializeServerVars(applyCh chan ApplyMsg) {
 }
 
 func printWarning(toPrint string) {
-	// fmt.Println("Warning: " + toPrint)
+	// // fmt.Println("Warning: " + toPrint)
 }
 
 func (rf *Raft) startServerState() {
-	rf.mu.Lock()
-	currentState := rf.currentRaftState
-	rf.mu.Unlock()
+	// rf.mu.Lock()
+	// currentState := rf.currentRaftState
+	// rf.mu.Unlock()
 
-	rf.changeServerStateTo(currentState)
+	// rf.changeServerStateTo(currentState)
+	rf.changeServerStateTo("follower")
 }
 
 // changes Raft's server state
 func (rf *Raft) changeServerStateTo(newServerState string) {
 
 	rf.mu.Lock()
+	// fmt.Println("s:", printMyID(rf.me, rf.currentRaftState), fmt.Sprintf(": st.c. %s->%s] t:", rf.currentRaftState[0:1], newServerState[0:1]), rf.currentTerm, "cI:", rf.commitIndex, "lA:", rf.lastApplied, rf.log, "(added to log at leader)")
 	rf.currentRaftState = newServerState
 	rf.persist()
 	rf.mu.Unlock()
@@ -409,7 +418,7 @@ func (rf *Raft) getAppendEntriesReply(args AppendEntriesArgs) (AppendEntriesRepl
 		if !rf.isPrevLogSame(args.PrevLogIndex, args.PrevLogTerm) {
 
 			reply.Success = false
-			// fmt.Println(rf.me, ":", rf.commitIndex, rf.lastApplied, rf.log, "(prev not same: rejected heartbeat from leader)")
+			// // fmt.Println(rf.me, ": t:", rf.currentTerm, "cI:", rf.commitIndex, "lA:", rf.lastApplied, rf.log, "(prev not same: rejected heartbeat from leader)")
 
 		} else {
 
@@ -424,7 +433,7 @@ func (rf *Raft) getAppendEntriesReply(args AppendEntriesArgs) (AppendEntriesRepl
 			}
 
 			reply.Success = true
-			// fmt.Println("added log from leader in", rf.me, "commitIndex:", rf.commitIndex, "log:", rf.log)
+			// // fmt.Println("added log from leader in", rf.me, "commitIndex:", rf.commitIndex, "log:", rf.log)
 		}
 
 		rf.persist()
@@ -449,7 +458,7 @@ func (rf *Raft) addEntriesFromLeaderToLog(args AppendEntriesArgs) {
 	// add entries ahead of it
 	rf.log = append(prunedLogSlice, args.Entries...)
 
-	// fmt.Println(rf.me, ":", rf.commitIndex, rf.lastApplied, rf.log, "(added", args.Entries, "from leader in heartbeat)")
+	// fmt.Println("s:", printMyID(rf.me, rf.currentRaftState), fmt.Sprintf(": [add to log from hb of %d] t:", args.LeaderId), rf.currentTerm, "cI:", rf.commitIndex, "lA:", rf.lastApplied, rf.log, "(added", args.Entries, "from leader in heartbeat)")
 }
 
 func (rf *Raft) isPrevLogSame(prevLogIndex int, prevLogTerm int) bool {
@@ -501,7 +510,7 @@ func (rf *Raft) getRequestVoteReply(args RequestVoteArgs) RequestVoteReply {
 			rf.currentTerm = args.Term
 			rf.votedFor = args.CandidateId
 
-			// fmt.Println(rf.me, ":", rf.commitIndex, rf.lastApplied, "(RV: cT changed from", rf.currentTerm, "to", args.Term, ")")
+			// // fmt.Println(rf.me, ": t:", rf.currentTerm, "cI:", rf.commitIndex, "lA:", rf.lastApplied, "(RV: cT changed from", rf.currentTerm, "to", args.Term, ")")
 
 		} else {
 			reply.Term = args.Term
@@ -726,7 +735,7 @@ func (rf *Raft) beCandidate() {
 			rf.appendEntriesReplyCh <- AppendEntriesReply{reply.Term, reply.Success}
 
 			// if the leader is legitimate
-			if isHeartbeatValid || reply.Term > myTerm {
+			if isHeartbeatValid {
 				// STATE TRANSITION: candidate -> follower
 				rf.changeServerStateTo("follower")
 				exitCandidateState = true
@@ -739,7 +748,7 @@ func (rf *Raft) beCandidate() {
 			// update our term
 			rf.mu.Lock()
 			rf.currentTerm = updatedTerm // vote for self
-			// fmt.Println(rf.me, ":", rf.commitIndex, rf.lastApplied, "(RV_Reply: cT changed from", rf.currentTerm, "to", updatedTerm, ")")
+			// // fmt.Println(rf.me, ":", rf.commitIndex, rf.lastApplied, "(RV_Reply: cT changed from", rf.currentTerm, "to", updatedTerm, ")")
 			rf.persist()
 			rf.mu.Unlock()
 
@@ -777,7 +786,7 @@ type AppendEntryRPCResponse struct {
 
 // wrapper func around sendAppendEntries(...) to receive RPC reply in a channel
 func (rf *Raft) sendAppendEntriesRPC(chanReplies chan AppendEntryRPCResponse, server int, args AppendEntriesArgs, reply *AppendEntriesReply) {
-	// // // fmt.Println("appendEntriesArg[i] is", args)
+	// // // // fmt.Println("appendEntriesArg[i] is", args)
 	ok := rf.sendAppendEntries(server, args, reply)
 	chanReplies <- AppendEntryRPCResponse{ok, AppendEntriesReply{reply.Term, reply.Success}, server}
 }
@@ -812,7 +821,7 @@ func (rf *Raft) getAppendEntriesArgs(numOfPeers int, myTerm int, myID int) ([]Ap
 
 	logLength := len(rf.log)
 
-	// // // fmt.Println("In getAppendEntriesArgs", rf.nextIndex)
+	// // // // fmt.Println("In getAppendEntriesArgs", rf.nextIndex)
 
 	for i, _ := range appendEntriesArgs {
 		if i != myID {
@@ -844,7 +853,7 @@ func (rf *Raft) handleHeartbeatSuccess(response AppendEntryRPCResponse, logLengt
 	// update matchIndex
 	rf.matchIndex[response.server] = nextIndexToPoint - 1
 
-	// // fmt.Println("updated state", rf.matchIndex, rf.nextIndex)
+	// // // fmt.Println("updated state", rf.matchIndex, rf.nextIndex)
 
 	// update commit index if logs are replicated in a majority qourum and log is in our current term
 	rf.updateCommitIndex(numOfPeers)
@@ -864,7 +873,7 @@ func (rf *Raft) handleHeartbeatFailure(response AppendEntryRPCResponse) bool {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	// // // fmt.Printf("handleHeartbeatFailure %d %d\n", rf.currentTerm, response.reply.Term)
+	// // // // fmt.Printf("handleHeartbeatFailure %d %d\n", rf.currentTerm, response.reply.Term)
 
 	// if the unsuccess is due to higher term leader, we need to fall back to follower
 	if rf.currentTerm < response.reply.Term {
@@ -876,7 +885,7 @@ func (rf *Raft) handleHeartbeatFailure(response AppendEntryRPCResponse) bool {
 	} else
 	// if the unsuccess is due to log inconsistency with the follower
 	{
-		// // // fmt.Println("going to decrement")
+		// // // // fmt.Println("going to decrement")
 		// decrement nextindex
 		rf.nextIndex[response.server]--
 
@@ -897,7 +906,7 @@ func (rf *Raft) sendHeartbeats(numOfPeers int, myTerm int, myID int, chanUpdated
 	// call RPCs
 	for i := 0; i < numOfPeers; i++ {
 		if i != myID {
-			// // // // fmt.Println("appendEntriesArg[i] is", appendEntriesArgs[i])
+			// // // // // fmt.Println("appendEntriesArg[i] is", appendEntriesArgs[i])
 			// a := appendEntriesArgs[i]
 			go rf.sendAppendEntriesRPC(chanReplies, i, AppendEntriesArgs{appendEntriesArgs[i].Term, appendEntriesArgs[i].LeaderId, appendEntriesArgs[i].PrevLogIndex, appendEntriesArgs[i].PrevLogTerm, appendEntriesArgs[i].Entries, appendEntriesArgs[i].LeaderCommit}, &AppendEntriesReply{Null, false})
 		}
@@ -919,7 +928,7 @@ func (rf *Raft) sendHeartbeats(numOfPeers int, myTerm int, myID int, chanUpdated
 				fallBackToFollower := rf.handleHeartbeatFailure(response)
 
 				if fallBackToFollower {
-					// // // // fmt.Println("fa")
+					// // // // // fmt.Println("fa")
 					// send updated term to leader go routine and end this thread
 					chanUpdatedTerm <- response.reply.Term
 					break
@@ -961,7 +970,7 @@ func (rf *Raft) applyToStateMachine() {
 
 				// if we have no commmitted entries that need to be applied, continue on
 				if rf.lastApplied >= rf.commitIndex {
-					// // fmt.Println("nahi kia in", rf.me, rf.lastApplied, rf.commitIndex)
+					// // // fmt.Println("nahi kia in", rf.me, rf.lastApplied, rf.commitIndex)
 					rf.mu.Unlock()
 					continue
 				}
@@ -969,8 +978,21 @@ func (rf *Raft) applyToStateMachine() {
 				// get a copy of logs to apply
 				logsToApply := rf.log[max(1, rf.lastApplied) : rf.commitIndex+1]
 
+				// // logging
+				// lA_before := rf.lastApplied
+
 				// update lastApplied
 				rf.lastApplied = rf.commitIndex
+
+				// // logging
+				// t := rf.currentTerm
+				// cI := rf.commitIndex
+				// lA_after := rf.lastApplied
+				// log := rf.log
+				// me := rf.me
+				// cS := rf.currentRaftState
+
+				// fmt.Println("s:", printMyID(me, cS), ": [app. to st. mac.] t:", t, "cI:", cI, "lA:", fmt.Sprintf("%d->%d", lA_before, lA_after), log, "(applied", logsToApply, "to state machine)")
 
 				// release lock
 				rf.mu.Unlock()
@@ -983,7 +1005,6 @@ func (rf *Raft) applyToStateMachine() {
 					}
 				}
 
-				// fmt.Println(me, ":", cI, lA, log, "(applied", logsToApply, "to state machine)")
 			}
 		}
 
@@ -1034,7 +1055,7 @@ func (rf *Raft) periodicallyCheckForCommits(numOfPeers int, endCh chan bool) {
 					}
 				}
 
-				// fmt.Println(me, ":", cI, lA, log, "(applied", logsToApply, " by leader to state machine)")
+				// // fmt.Println(me, ":", cI, lA, log, "(applied", logsToApply, " by leader to state machine)")
 
 			} else {
 				rf.mu.Unlock()
@@ -1118,11 +1139,11 @@ func (rf *Raft) beLeader() {
 	myID := rf.me
 	lastLogIndex := len(rf.log) - 1
 	// printWarning(fmt.Sprintf("lastlogindex: %d", lastLogIndex))
-	// fmt.Println("new leader:", rf.me, rf.log)
+	// // fmt.Println("new leader:", rf.me, rf.log)
 
 	// leader's volatile state
 	rf.nextIndex = getNewIntArray(numOfPeers, lastLogIndex+1)
-	// // // fmt.Println(rf.nextIndex)
+	// // // // fmt.Println(rf.nextIndex)
 	rf.matchIndex = getNewIntArray(numOfPeers, 0)
 
 	// rf.persist()
@@ -1154,7 +1175,7 @@ func (rf *Raft) beLeader() {
 			// change state
 			rf.mu.Lock()
 			rf.currentTerm = newTerm
-			// fmt.Println(rf.me, ":", rf.commitIndex, rf.lastApplied, "(AE_Reply: cT changed from", rf.currentTerm, "to", newTerm, ")")
+			// // fmt.Println(rf.me, ":", rf.commitIndex, rf.lastApplied, "(AE_Reply: cT changed from", rf.currentTerm, "to", newTerm, ")")
 			rf.persist()
 			rf.mu.Unlock()
 
@@ -1172,7 +1193,7 @@ func (rf *Raft) beLeader() {
 			rf.appendEntriesReplyCh <- AppendEntriesReply{reply.Term, reply.Success}
 
 			// if the leader is legitimate
-			if isHeartbeatValid || reply.Term > myTerm {
+			if isHeartbeatValid {
 
 				// STATE TRANSITION: leader -> follower
 				rf.changeServerStateTo("follower")
