@@ -7,6 +7,7 @@ import (
 	"log"
 	"raft"
 	"sync"
+	"time"
 )
 
 const Debug = 0
@@ -26,11 +27,7 @@ type Op struct {
 }
 
 type OpRecord struct {
-	commandID       int64
-	replyCh         chan rpcReply
-	expectedIndex   int
-	expectedTerm    int
-	isExecuted      bool
+	op              Op
 	executionResult string
 }
 
@@ -47,16 +44,19 @@ type RaftKV struct {
 
 	maxraftstate int // snapshot if log grows this big
 
-	isLeader bool
+	isLeader    bool
+	currentTerm int
 
 	// Your definitions here.
 	values map[string]string
 
 	// recordOfPendingIntents
-	opRecords map[int64]OpRecord
+	opHistory  map[int64]OpRecord
+	waitingOps map[int64]chan rpcReply
 
 	// kill
-	stopListenToApplyCh chan bool
+	stopListenToApplyCh      chan bool
+	stopListenToStateChanges chan bool
 }
 
 func (kv *RaftKV) executeOperation(op Op) string {
@@ -73,60 +73,61 @@ func (kv *RaftKV) executeOperation(op Op) string {
 	return result
 }
 
-func (kv *RaftKV) modifyOpRecord(commandID int64, result string) chan rpcReply {
-	prevRec := kv.opRecords[commandID]
-	kv.opRecords[commandID] = OpRecord{
-		commandID:       prevRec.commandID,
-		replyCh:         prevRec.replyCh,
-		expectedIndex:   prevRec.expectedIndex,
-		expectedTerm:    prevRec.expectedTerm,
-		isExecuted:      true,
-		executionResult: result,
+func (kv *RaftKV) notifyToRPC(op Op, result string) {
+	replyCh, isPresent := kv.waitingOps[op.CommandID]
+	delete(kv.waitingOps, op.CommandID)
+	if isPresent {
+		me, name, k, v, cmdID := kv.me, op.OpName, op.Key, op.Value, op.CommandID
+		fmt.Printf("s%d notifToCh[*]: %s, k:%s, v:%s, %v\n", me, name, k, v, cmdID)
+		replyCh <- rpcReply{result, ""}
+		fmt.Printf("s%d notifToCh[**]: %s, k:%s, v:%s, %v\n", me, name, k, v, cmdID)
 	}
-	return prevRec.replyCh
 }
 
-func (kv *RaftKV) notifyToRPCCh(replyCh chan rpcReply, result string) {
-	replyCh <- rpcReply{result, ""}
+func (kv *RaftKV) getOpFromHistory(commandID int64) (string, bool) {
+	result, isPresent := kv.opHistory[commandID]
+	return result.executionResult, isPresent
+}
+
+func (kv *RaftKV) storeInHistory(op Op, result string) {
+	kv.opHistory[op.CommandID] = OpRecord{op, result}
 }
 
 func (kv *RaftKV) handleApply(log raft.ApplyMsg) {
 	kv.mu.Lock()
+	defer kv.mu.Unlock()
 
-	// execute
+	// get op
 	op := log.Command.(Op)
-	result := kv.executeOperation(op)
+
+	// check if op is already executed
+	result, isAlreadyExecuted := kv.getOpFromHistory(op.CommandID)
+	if !isAlreadyExecuted {
+		// if not executed, exectute
+		result = kv.executeOperation(op)
+		kv.storeInHistory(op, result)
+	}
 	kv.printValues(op)
 
-	wasLeader := kv.isLeader
-	_, isLeader := kv.rf.GetState()
-	kv.isLeader = isLeader
+	// if there is a wait for the value
+	kv.notifyToRPC(op, result)
 
-	if isLeader {
-		// modify op record
-		replyCh := kv.modifyOpRecord(op.CommandID, result)
-		me, name, k, v, cmdID := kv.me, op.OpName, op.Key, op.Value, op.CommandID
-		kv.mu.Unlock()
-		// send to appropriate channel
-		fmt.Printf("s%d notifToCh[*]: %s, k:%s, v:%s, %v\n", me, name, k, v, cmdID)
-		kv.notifyToRPCCh(replyCh, result)
-		fmt.Printf("s%d notifToCh[**]: %s, k:%s, v:%s, %v\n", me, name, k, v, cmdID)
-	} else {
-		// if it considered itself leader previously
-		if wasLeader {
-			// clear state
-			for k, v := range kv.opRecords {
-				if !v.isExecuted {
-					fmt.Println("!")
-					v.replyCh <- rpcReply{"", "leader changed!"}
-					fmt.Println("!!")
-				}
-				delete(kv.opRecords, k)
-			}
+	// if state changed, then reply to your channels that there was an error
+
+	// store prev state, and update current state
+	wasLeader, prevTerm := kv.isLeader, kv.currentTerm
+	kv.currentTerm, kv.isLeader = kv.rf.GetState()
+
+	// if server was a leader earlier, or there has been an increase in term
+	if (wasLeader && !kv.isLeader) || kv.currentTerm != prevTerm {
+		// clear waiting operations
+		for i, replyCh := range kv.waitingOps {
+			fmt.Println("!")
+			replyCh <- rpcReply{"", "leader changed!"}
+			fmt.Println("!!")
+			delete(kv.waitingOps, i)
 		}
-		kv.mu.Unlock()
 	}
-
 }
 
 func (kv *RaftKV) printValues(cmd Op) {
@@ -143,7 +144,6 @@ func (kv *RaftKV) listenToApplyCh() {
 	for {
 		select {
 		case log := <-kv.applyCh:
-
 			kv.handleApply(log)
 		case <-kv.stopListenToApplyCh:
 			exit = true
@@ -155,52 +155,96 @@ func (kv *RaftKV) listenToApplyCh() {
 	}
 }
 
+func (kv *RaftKV) handleStateChange() {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	// if state changed, then reply to your channels that there was an error
+
+	// store prev state, and update current state
+	wasLeader, prevTerm := kv.isLeader, kv.currentTerm
+	kv.currentTerm, kv.isLeader = kv.rf.GetState()
+
+	// if server was a leader earlier, or there has been an increase in term
+	if (wasLeader && !kv.isLeader) || kv.currentTerm != prevTerm {
+		// clear waiting operations
+		for i, replyCh := range kv.waitingOps {
+			fmt.Println("!")
+			replyCh <- rpcReply{"", "leader changed!"}
+			fmt.Println("!!")
+			delete(kv.waitingOps, i)
+		}
+	}
+}
+
+func (kv *RaftKV) listenToStateChanges() {
+	exit := false
+	for {
+		select {
+		case <-kv.stopListenToStateChanges:
+			exit = true
+		default:
+			kv.handleStateChange()
+			time.Sleep(time.Millisecond * 250)
+		}
+
+		if exit {
+			break
+		}
+	}
+}
+
 func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
+
+	// reply.WrongLeader = false
+	// reply.Err = ""
+
+	// kv.mu.Lock()
+
+	// opRecord, opRecordExists := kv.opRecords[args.CommandID]
+	// var expectedIndex, expectedTerm int
+
+	// if opRecordExists {
+	// 	if opRecord.isExecuted {
+	// 		reply.Value = opRecord.executionResult
+	// 		fmt.Printf("s%d isExecuted...replying args:%v reply:%v\n", kv.me, args, reply)
+	// 		kv.mu.Unlock()
+	// 		return
+	// 	} else {
+	// 		// wait for it to be executed
+	// 		expectedIndex = opRecord.expectedIndex
+	// 		expectedTerm = opRecord.expectedTerm
+	// 		fmt.Printf("s%d exists...eI:%d eT:%d args:%v reply:%v\n", kv.me, expectedIndex, expectedTerm, args, reply)
+	// 	}
+	// } else {
+	// 	var isLeader bool
+	// 	expectedIndex, expectedTerm, isLeader = kv.rf.Start(Op{"Get", args.Key, "", args.CommandID})
+	// 	fmt.Printf("s%d started...iL:%v eI:%d eT:%d args:%v reply:%v\n", kv.me, isLeader, expectedIndex, expectedTerm, args, reply)
+	// 	if !isLeader {
+	// 		reply.WrongLeader = true
+	// 		fmt.Printf("s%d not leader...replying eI:%d eT:%d args:%v reply:%v\n", kv.me, expectedIndex, expectedTerm, args, reply)
+	// 		kv.mu.Unlock()
+	// 		return
+	// 	}
+	// }
 
 	reply.WrongLeader = false
 	reply.Err = ""
 
 	kv.mu.Lock()
 
-	opRecord, opRecordExists := kv.opRecords[args.CommandID]
-	var expectedIndex, expectedTerm int
+	op := Op{"Get", args.Key, "", args.CommandID}
 
-	if opRecordExists {
-		if opRecord.isExecuted {
-			reply.Value = opRecord.executionResult
-			fmt.Printf("s%d isExecuted...replying args:%v reply:%v\n", kv.me, args, reply)
-			kv.mu.Unlock()
-			return
-		} else {
-			// wait for it to be executed
-			expectedIndex = opRecord.expectedIndex
-			expectedTerm = opRecord.expectedTerm
-			fmt.Printf("s%d exists...eI:%d eT:%d args:%v reply:%v\n", kv.me, expectedIndex, expectedTerm, args, reply)
-		}
-	} else {
-		var isLeader bool
-		expectedIndex, expectedTerm, isLeader = kv.rf.Start(Op{"Get", args.Key, "", args.CommandID})
-		fmt.Printf("s%d started...iL:%v eI:%d eT:%d args:%v reply:%v\n", kv.me, isLeader, expectedIndex, expectedTerm, args, reply)
-		if !isLeader {
-			reply.WrongLeader = true
-			fmt.Printf("s%d not leader...replying eI:%d eT:%d args:%v reply:%v\n", kv.me, expectedIndex, expectedTerm, args, reply)
-			kv.mu.Unlock()
-			return
-		}
+	eI, eT, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		reply.WrongLeader = true
+		kv.mu.Unlock()
+		return
 	}
 
 	replyCh := make(chan rpcReply)
-
-	kv.opRecords[args.CommandID] = OpRecord{
-		commandID:       args.CommandID,
-		replyCh:         replyCh,
-		expectedIndex:   expectedIndex,
-		expectedTerm:    expectedTerm,
-		isExecuted:      false,
-		executionResult: "",
-	}
-
-	fmt.Printf("s%dwaiting for completion eI:%d eT:%d args:%v reply:%v\n", kv.me, expectedIndex, expectedTerm, args, reply)
+	kv.waitingOps[args.CommandID] = replyCh
+	fmt.Printf("s%dwaiting for completion eI:%d eT:%d args:%v reply:%v\n", kv.me, eI, eT, args, reply)
 
 	kv.mu.Unlock()
 
@@ -213,49 +257,54 @@ func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
 
 func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 
+	// reply.WrongLeader = false
+	// reply.Err = ""
+
+	// kv.mu.Lock()
+
+	// opRecord, opRecordExists := kv.opRecords[args.CommandID]
+	// var expectedIndex, expectedTerm int
+
+	// if opRecordExists {
+	// 	if opRecord.isExecuted {
+	// 		fmt.Printf("s%d isExecuted...replying args:%v reply:%v\n", kv.me, args, reply)
+	// 		kv.mu.Unlock()
+	// 		return
+	// 	} else {
+	// 		// wait for it to be executed
+	// 		expectedIndex = opRecord.expectedIndex
+	// 		expectedTerm = opRecord.expectedTerm
+	// 		fmt.Printf("s%d exists...eI:%d eT:%d args:%v reply:%v\n", kv.me, expectedIndex, expectedTerm, args, reply)
+	// 	}
+	// } else {
+	// 	var isLeader bool
+	// 	expectedIndex, expectedTerm, isLeader = kv.rf.Start(Op{args.Op, args.Key, args.Value, args.CommandID})
+	// 	fmt.Printf("s%d started...iL:%v eI:%d eT:%d args:%v reply:%v\n", kv.me, isLeader, expectedIndex, expectedTerm, args, reply)
+	// 	if !isLeader {
+	// 		reply.WrongLeader = true
+	// 		fmt.Printf("s%d not leader...replying eI:%d eT:%d args:%v reply:%v\n", kv.me, expectedIndex, expectedTerm, args, reply)
+	// 		kv.mu.Unlock()
+	// 		return
+	// 	}
+	// }
+
 	reply.WrongLeader = false
 	reply.Err = ""
 
 	kv.mu.Lock()
 
-	opRecord, opRecordExists := kv.opRecords[args.CommandID]
-	var expectedIndex, expectedTerm int
+	op := Op{args.Op, args.Key, args.Value, args.CommandID}
 
-	if opRecordExists {
-		if opRecord.isExecuted {
-			fmt.Printf("s%d isExecuted...replying args:%v reply:%v\n", kv.me, args, reply)
-			kv.mu.Unlock()
-			return
-		} else {
-			// wait for it to be executed
-			expectedIndex = opRecord.expectedIndex
-			expectedTerm = opRecord.expectedTerm
-			fmt.Printf("s%d exists...eI:%d eT:%d args:%v reply:%v\n", kv.me, expectedIndex, expectedTerm, args, reply)
-		}
-	} else {
-		var isLeader bool
-		expectedIndex, expectedTerm, isLeader = kv.rf.Start(Op{args.Op, args.Key, args.Value, args.CommandID})
-		fmt.Printf("s%d started...iL:%v eI:%d eT:%d args:%v reply:%v\n", kv.me, isLeader, expectedIndex, expectedTerm, args, reply)
-		if !isLeader {
-			reply.WrongLeader = true
-			fmt.Printf("s%d not leader...replying eI:%d eT:%d args:%v reply:%v\n", kv.me, expectedIndex, expectedTerm, args, reply)
-			kv.mu.Unlock()
-			return
-		}
+	eI, eT, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		reply.WrongLeader = true
+		kv.mu.Unlock()
+		return
 	}
 
 	replyCh := make(chan rpcReply)
-
-	kv.opRecords[args.CommandID] = OpRecord{
-		commandID:       args.CommandID,
-		replyCh:         replyCh,
-		expectedIndex:   expectedIndex,
-		expectedTerm:    expectedTerm,
-		isExecuted:      false,
-		executionResult: "",
-	}
-
-	fmt.Printf("s%dwaiting for completion eI:%d eT:%d args:%v reply:%v\n", kv.me, expectedIndex, expectedTerm, args, reply)
+	kv.waitingOps[args.CommandID] = replyCh
+	fmt.Printf("s%dwaiting for completion eI:%d eT:%d args:%v reply:%v\n", kv.me, eI, eT, args, reply)
 
 	kv.mu.Unlock()
 
@@ -274,6 +323,7 @@ func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 func (kv *RaftKV) Kill() {
 	kv.rf.Kill()
 	// Your code here, if desired.
+	kv.stopListenToApplyCh <- true
 	kv.stopListenToApplyCh <- true
 }
 
@@ -302,6 +352,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.maxraftstate = maxraftstate
 	kv.values = make(map[string]string)
 	kv.isLeader = false
+	kv.currentTerm = 0
 
 	// Your initialization code here.
 
@@ -309,9 +360,12 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	kv.stopListenToApplyCh = make(chan bool)
-	kv.opRecords = make(map[int64]OpRecord)
+	kv.stopListenToStateChanges = make(chan bool)
+	kv.opHistory = make(map[int64]OpRecord)
+	kv.waitingOps = make(map[int64]chan rpcReply)
 
 	go kv.listenToApplyCh()
+	go kv.listenToStateChanges()
 
 	return kv
 }
