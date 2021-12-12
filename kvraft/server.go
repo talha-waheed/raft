@@ -324,7 +324,7 @@ func (kv *RaftKV) Kill() {
 	kv.rf.Kill()
 	// Your code here, if desired.
 	kv.stopListenToApplyCh <- true
-	kv.stopListenToApplyCh <- true
+	kv.stopListenToStateChanges <- true
 }
 
 //

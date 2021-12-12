@@ -56,30 +56,52 @@ func (ck *Clerk) Get(key string) string {
 		tn := time.Now()
 		fmt.Printf("%v Get begun s:%d k:%s v:%s cmdID:%v\n", f, server, args.Key, "", commandID)
 
-		ok := ck.servers[server].Call("RaftKV.Get", &args, &reply)
+		replyCh := make(chan AsyncRPCReply)
 
-		if !ok {
-			// ok timeout
-			server = (server + 1) % len(ck.servers)
-			fmt.Println(f, " timed out after ", time.Since(tn))
-			continue
-		}
-		if reply.WrongLeader {
-			server = (server + 1) % len(ck.servers)
-			fmt.Println(f, " WrongLeader after ", time.Since(tn))
-			continue
-		}
-		if reply.Err != "" {
-			server = (server + 1) % len(ck.servers)
-			fmt.Println(f, " Err after ", time.Since(tn))
-			continue
-		}
+		go ck.asyncRPC(server, replyCh, "RaftKV.Get", &args, &reply)
 
-		// we have successfully put the value, so
-		ck.expectedLeader = server
-		fmt.Println(f, " returned ", reply.Value, " after ", time.Since(tn))
-		return reply.Value
+		// get timer for a heartbeat interval
+		heartbeatTimer := time.NewTimer(time.Second)
+
+		select {
+		// if heartbeat times out
+		case <-heartbeatTimer.C:
+			// next server
+			server = (server + 1) % len(ck.servers)
+			fmt.Println(f, " timed out (forced) after ", time.Since(tn))
+
+		case rpcReply := <-replyCh:
+
+			reply, ok := rpcReply.reply.(*GetReply), rpcReply.ok
+
+			if !ok {
+				// ok timeout
+				server = (server + 1) % len(ck.servers)
+				fmt.Println(f, " timed out after ", time.Since(tn))
+			} else if reply.WrongLeader {
+				server = (server + 1) % len(ck.servers)
+				fmt.Println(f, " WrongLeader after ", time.Since(tn))
+			} else if reply.Err != "" {
+				server = (server + 1) % len(ck.servers)
+				fmt.Println(f, " Err after ", time.Since(tn))
+			} else {
+				// we have successfully put the value, so
+				ck.expectedLeader = server
+				fmt.Println(f, " put returned after ", time.Since(tn))
+				return reply.Value
+			}
+		}
 	}
+}
+
+type AsyncRPCReply struct {
+	reply interface{}
+	ok    bool
+}
+
+func (ck *Clerk) asyncRPC(server int, replyCh chan AsyncRPCReply, rpcName string, args interface{}, reply interface{}) {
+	ok := ck.servers[server].Call(rpcName, args, reply)
+	replyCh <- AsyncRPCReply{reply, ok}
 }
 
 //
@@ -106,29 +128,43 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		tn := time.Now()
 		fmt.Printf("%v Put begun s:%d k:%s v:%s cmdID:%v\n", f, server, args.Key, args.Value, commandID)
 
-		ok := ck.servers[server].Call("RaftKV.PutAppend", &args, &reply)
+		replyCh := make(chan AsyncRPCReply)
 
-		if !ok {
-			// ok timeout
-			server = (server + 1) % len(ck.servers)
-			fmt.Println(f, " timed out after ", time.Since(tn))
-			continue
-		}
-		if reply.WrongLeader {
-			server = (server + 1) % len(ck.servers)
-			fmt.Println(f, " WrongLeader after ", time.Since(tn))
-			continue
-		}
-		if reply.Err != "" {
-			server = (server + 1) % len(ck.servers)
-			fmt.Println(f, " Err after ", time.Since(tn))
-			continue
-		}
+		go ck.asyncRPC(server, replyCh, "RaftKV.PutAppend", &args, &reply)
 
-		// we have successfully put the value, so
-		ck.expectedLeader = server
-		fmt.Println(f, " put returned after ", time.Since(tn))
-		break
+		// get timer for a heartbeat interval
+		heartbeatTimer := time.NewTimer(time.Second)
+
+		select {
+		// if heartbeat times out
+		case <-heartbeatTimer.C:
+			// next server
+			server = (server + 1) % len(ck.servers)
+			fmt.Println(f, " timed out (forced) after ", time.Since(tn))
+
+		case rpcReply := <-replyCh:
+
+			fmt.Println("here")
+
+			reply, ok := rpcReply.reply.(*PutAppendReply), rpcReply.ok
+
+			if !ok {
+				// ok timeout
+				server = (server + 1) % len(ck.servers)
+				fmt.Println(f, " timed out after ", time.Since(tn))
+			} else if reply.WrongLeader {
+				server = (server + 1) % len(ck.servers)
+				fmt.Println(f, " WrongLeader after ", time.Since(tn))
+			} else if reply.Err != "" {
+				server = (server + 1) % len(ck.servers)
+				fmt.Println(f, " Err after ", time.Since(tn))
+			} else {
+				// we have successfully put the value, so
+				ck.expectedLeader = server
+				fmt.Println(f, " put returned after ", time.Since(tn))
+				return
+			}
+		}
 	}
 }
 
