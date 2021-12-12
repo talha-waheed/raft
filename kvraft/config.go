@@ -1,16 +1,19 @@
 package raftkv
 
-import "labrpc"
-import "testing"
-import "os"
+import (
+	"labrpc"
+	"log"
+	"os"
+	"testing"
 
-// import "log"
-import crand "crypto/rand"
-import "math/rand"
-import "encoding/base64"
-import "sync"
-import "runtime"
-import "raft"
+	// import "log"
+	crand "crypto/rand"
+	"encoding/base64"
+	"math/rand"
+	"raft"
+	"runtime"
+	"sync"
+)
 
 func randstring(n int) string {
 	b := make([]byte, 2*n)
@@ -93,7 +96,7 @@ func (cfg *config) connect(i int, to []int) {
 // detach server i from the servers listed in from
 // caller must hold cfg.mu
 func (cfg *config) disconnectUnlocked(i int, from []int) {
-	// log.Printf("disconnect peer %d from %v\n", i, from)
+	log.Printf("disconnect peer %d from %v\n", i, from)
 
 	// outgoing socket files
 	for j := 0; j < len(from); j++ {
@@ -201,7 +204,7 @@ func (cfg *config) ConnectClient(ck *Clerk, to []int) {
 
 // caller should hold cfg.mu
 func (cfg *config) DisconnectClientUnlocked(ck *Clerk, from []int) {
-	// log.Printf("DisconnectClient %v from %v\n", ck, from)
+	log.Printf("DisconnectClient %v from %v\n", ck, from)
 	endnames := cfg.clerks[ck]
 	for j := 0; j < len(from); j++ {
 		s := endnames[from[j]]
