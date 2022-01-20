@@ -68,7 +68,7 @@ func (kv *RaftKV) executeOperation(op Op) string {
 	} else if op.OpName == "Get" {
 		result = kv.values[op.Key]
 	} else {
-		fmt.Println("WHATTT")
+		// fmt.Println("WHATTT")
 	}
 	return result
 }
@@ -77,10 +77,10 @@ func (kv *RaftKV) notifyToRPC(op Op, result string) {
 	replyCh, isPresent := kv.waitingOps[op.CommandID]
 	delete(kv.waitingOps, op.CommandID)
 	if isPresent {
-		me, name, k, v, cmdID := kv.me, op.OpName, op.Key, op.Value, op.CommandID
-		fmt.Printf("s%d notifToCh[*]: %s, k:%s, v:%s, %v\n", me, name, k, v, cmdID)
+		// me, name, k, v, cmdID := kv.me, op.OpName, op.Key, op.Value, op.CommandID
+		// fmt.Printf("s%d notifToCh[*]: %s, k:%s, v:%s, %v\n", me, name, k, v, cmdID)
 		replyCh <- rpcReply{result, ""}
-		fmt.Printf("s%d notifToCh[**]: %s, k:%s, v:%s, %v\n", me, name, k, v, cmdID)
+		// fmt.Printf("s%d notifToCh[**]: %s, k:%s, v:%s, %v\n", me, name, k, v, cmdID)
 	}
 }
 
@@ -107,7 +107,7 @@ func (kv *RaftKV) handleApply(log raft.ApplyMsg) {
 		result = kv.executeOperation(op)
 		kv.storeInHistory(op, result)
 	}
-	kv.printValues(op)
+	// kv.printValues(op)
 
 	// if there is a wait for the value
 	kv.notifyToRPC(op, result)
@@ -122,9 +122,9 @@ func (kv *RaftKV) handleApply(log raft.ApplyMsg) {
 	if (wasLeader && !kv.isLeader) || kv.currentTerm != prevTerm {
 		// clear waiting operations
 		for i, replyCh := range kv.waitingOps {
-			fmt.Println("!")
+			// fmt.Println("!")
 			replyCh <- rpcReply{"", "leader changed!"}
-			fmt.Println("!!")
+			// fmt.Println("!!")
 			delete(kv.waitingOps, i)
 		}
 	}
@@ -169,9 +169,9 @@ func (kv *RaftKV) handleStateChange() {
 	if (wasLeader && !kv.isLeader) || kv.currentTerm != prevTerm {
 		// clear waiting operations
 		for i, replyCh := range kv.waitingOps {
-			fmt.Println("!")
+			// fmt.Println("!")
 			replyCh <- rpcReply{"", "leader changed!"}
-			fmt.Println("!!")
+			// fmt.Println("!!")
 			delete(kv.waitingOps, i)
 		}
 	}
@@ -196,38 +196,6 @@ func (kv *RaftKV) listenToStateChanges() {
 
 func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
 
-	// reply.WrongLeader = false
-	// reply.Err = ""
-
-	// kv.mu.Lock()
-
-	// opRecord, opRecordExists := kv.opRecords[args.CommandID]
-	// var expectedIndex, expectedTerm int
-
-	// if opRecordExists {
-	// 	if opRecord.isExecuted {
-	// 		reply.Value = opRecord.executionResult
-	// 		fmt.Printf("s%d isExecuted...replying args:%v reply:%v\n", kv.me, args, reply)
-	// 		kv.mu.Unlock()
-	// 		return
-	// 	} else {
-	// 		// wait for it to be executed
-	// 		expectedIndex = opRecord.expectedIndex
-	// 		expectedTerm = opRecord.expectedTerm
-	// 		fmt.Printf("s%d exists...eI:%d eT:%d args:%v reply:%v\n", kv.me, expectedIndex, expectedTerm, args, reply)
-	// 	}
-	// } else {
-	// 	var isLeader bool
-	// 	expectedIndex, expectedTerm, isLeader = kv.rf.Start(Op{"Get", args.Key, "", args.CommandID})
-	// 	fmt.Printf("s%d started...iL:%v eI:%d eT:%d args:%v reply:%v\n", kv.me, isLeader, expectedIndex, expectedTerm, args, reply)
-	// 	if !isLeader {
-	// 		reply.WrongLeader = true
-	// 		fmt.Printf("s%d not leader...replying eI:%d eT:%d args:%v reply:%v\n", kv.me, expectedIndex, expectedTerm, args, reply)
-	// 		kv.mu.Unlock()
-	// 		return
-	// 	}
-	// }
-
 	reply.WrongLeader = false
 	reply.Err = ""
 
@@ -235,7 +203,7 @@ func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
 
 	op := Op{"Get", args.Key, "", args.CommandID}
 
-	eI, eT, isLeader := kv.rf.Start(op)
+	_, _, isLeader := kv.rf.Start(op)
 	if !isLeader {
 		reply.WrongLeader = true
 		kv.mu.Unlock()
@@ -244,7 +212,7 @@ func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
 
 	replyCh := make(chan rpcReply)
 	kv.waitingOps[args.CommandID] = replyCh
-	fmt.Printf("s%dwaiting for completion eI:%d eT:%d args:%v reply:%v\n", kv.me, eI, eT, args, reply)
+	// fmt.Printf("s%dwaiting for completion eI:%d eT:%d args:%v reply:%v\n", kv.me, eI, eT, args, reply)
 
 	kv.mu.Unlock()
 
@@ -257,37 +225,6 @@ func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
 
 func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 
-	// reply.WrongLeader = false
-	// reply.Err = ""
-
-	// kv.mu.Lock()
-
-	// opRecord, opRecordExists := kv.opRecords[args.CommandID]
-	// var expectedIndex, expectedTerm int
-
-	// if opRecordExists {
-	// 	if opRecord.isExecuted {
-	// 		fmt.Printf("s%d isExecuted...replying args:%v reply:%v\n", kv.me, args, reply)
-	// 		kv.mu.Unlock()
-	// 		return
-	// 	} else {
-	// 		// wait for it to be executed
-	// 		expectedIndex = opRecord.expectedIndex
-	// 		expectedTerm = opRecord.expectedTerm
-	// 		fmt.Printf("s%d exists...eI:%d eT:%d args:%v reply:%v\n", kv.me, expectedIndex, expectedTerm, args, reply)
-	// 	}
-	// } else {
-	// 	var isLeader bool
-	// 	expectedIndex, expectedTerm, isLeader = kv.rf.Start(Op{args.Op, args.Key, args.Value, args.CommandID})
-	// 	fmt.Printf("s%d started...iL:%v eI:%d eT:%d args:%v reply:%v\n", kv.me, isLeader, expectedIndex, expectedTerm, args, reply)
-	// 	if !isLeader {
-	// 		reply.WrongLeader = true
-	// 		fmt.Printf("s%d not leader...replying eI:%d eT:%d args:%v reply:%v\n", kv.me, expectedIndex, expectedTerm, args, reply)
-	// 		kv.mu.Unlock()
-	// 		return
-	// 	}
-	// }
-
 	reply.WrongLeader = false
 	reply.Err = ""
 
@@ -295,7 +232,7 @@ func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 
 	op := Op{args.Op, args.Key, args.Value, args.CommandID}
 
-	eI, eT, isLeader := kv.rf.Start(op)
+	_, _, isLeader := kv.rf.Start(op)
 	if !isLeader {
 		reply.WrongLeader = true
 		kv.mu.Unlock()
@@ -304,7 +241,7 @@ func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 
 	replyCh := make(chan rpcReply)
 	kv.waitingOps[args.CommandID] = replyCh
-	fmt.Printf("s%dwaiting for completion eI:%d eT:%d args:%v reply:%v\n", kv.me, eI, eT, args, reply)
+	// fmt.Printf("s%dwaiting for completion eI:%d eT:%d args:%v reply:%v\n", kv.me, eI, eT, args, reply)
 
 	kv.mu.Unlock()
 
@@ -322,7 +259,7 @@ func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 //
 func (kv *RaftKV) Kill() {
 	kv.rf.Kill()
-	// Your code here, if desired.
+
 	kv.stopListenToApplyCh <- true
 	kv.stopListenToStateChanges <- true
 }
@@ -345,7 +282,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	// Go's RPC library to marshall/unmarshall.
 	gob.Register(Op{})
 
-	fmt.Println("# of servers: ", len(servers))
+	// fmt.Println("# of servers: ", len(servers))
 
 	kv := new(RaftKV)
 	kv.me = me

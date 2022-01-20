@@ -361,6 +361,9 @@ func (rf *Raft) changeServerStateTo(newServerState string) {
 	// fmt.Println("s:", printMyID(rf.me, rf.currentRaftState), fmt.Sprintf(": st.c. %s->%s] t:", rf.currentRaftState[0:1], newServerState[0:1]), rf.currentTerm, "cI:", rf.commitIndex, "lA:", rf.lastApplied, rf.log, "(added to log at leader)")
 	rf.currentRaftState = newServerState
 	rf.persist()
+	// if newServerState == "leader" {
+	// 	fmt.Println("-----------", rf.me, "is leader")
+	// }
 	rf.mu.Unlock()
 
 	if newServerState == "follower" {
@@ -976,7 +979,9 @@ func (rf *Raft) applyToStateMachine() {
 				}
 
 				// get a copy of logs to apply
-				logsToApply := rf.log[max(1, rf.lastApplied) : rf.commitIndex+1]
+				logsToApplyShallow := rf.log[max(1, rf.lastApplied+1) : rf.commitIndex+1]
+				logsToApply := make([]Log, len(logsToApplyShallow))
+				copy(logsToApply, logsToApplyShallow)
 
 				// // logging
 				// lA_before := rf.lastApplied
@@ -992,7 +997,7 @@ func (rf *Raft) applyToStateMachine() {
 				// me := rf.me
 				// cS := rf.currentRaftState
 
-				// fmt.Println("s:", printMyID(me, cS), ": [app. to st. mac.] t:", t, "cI:", cI, "lA:", fmt.Sprintf("%d->%d", lA_before, lA_after), log, "(applied", logsToApply, "to state machine)")
+				// fmt.Println("s:", printMyID(me, cS), ": [app. to st. mac.] t:", t, "cI:", cI, "lA:", fmt.Sprintf("%d->%d", lA_before, lA_after), "(applied", logsToApply, "to state machine)", log)
 
 				// release lock
 				rf.mu.Unlock()
