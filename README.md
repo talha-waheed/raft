@@ -1,2 +1,3 @@
-# DS_PA2
-Private repo for Distr Sys PA2
+# Raft Implementation
+
+Implementation of Raft for 'CS582: Distributed Systems' programming assignments.
